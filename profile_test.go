@@ -98,6 +98,13 @@ func TestProfile_isCreditExhausted(t *testing.T) {
 	if fc.isCreditExhausted(429, nil) {
 		t.Error("firecrawl isCreditExhausted(429) = true, want false")
 	}
+	// 429 with "exceeded" in body must NOT be treated as credit exhaustion.
+	// (The word "exceeded" in a rate-limit message like "rate limit exceeded"
+	// should not match the creditExhaustedPattern — it's a rate-limit, not
+	// a credit balance of zero.)
+	if fc.isCreditExhausted(429, []byte(`{"success":false,"error":"rate limit exceeded"}`)) {
+		t.Error("firecrawl isCreditExhausted(429 with 'exceeded' body) = true, want false")
+	}
 
 	tv := &Profile{Name: "tavily"}
 	if !tv.isCreditExhausted(432, nil) || !tv.isCreditExhausted(433, nil) {

@@ -100,6 +100,9 @@ func (p *Profile) isCreditExhausted(status int, body []byte) bool {
 	if status == 402 {
 		return true
 	}
+	if status == 429 {
+		return false // rate-limit never disables a key, regardless of body text
+	}
 	if firecrawlFailure(status, body) {
 		return creditExhaustedPattern.Find(body) != nil
 	}
