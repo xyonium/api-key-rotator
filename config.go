@@ -25,6 +25,13 @@ type Config struct {
 	LowCreditThreshold  int64 // switch off a key when its remainingCredits drops to/below this (default 10)
 	StopCreditThreshold int64 // stop accepting requests when every key is below this (default 2)
 	CreditRefreshSec    int   // seconds between background remainingCredits refreshes (default 300)
+	// Firecrawl per-key concurrency control (firecrawl profile only). See
+	// "Concurrent browser limits" in the Firecrawl docs: each free key is ~2
+	// concurrent browsers, so a sub-agent burst on one key triggers 429s.
+	FirecrawlMaxConcurrentPerKey  int    // max in-flight requests per firecrawl key (default 1, 0 = unlimited)
+	FirecrawlConcurrencySaturation string // "queue" (wait for a slot) or "reject" (429) when all keys busy
+	FirecrawlConcurrencyQueueMs   int    // how long a queued request waits for a free slot (default 15000)
+	Firecrawl403Retries           int    // same-key retries on a 403 before rotating (default 1; 0 = legacy full backoff)
 	Tavily              TavilyConfig
 	Apify               ApifyConfig
 }
@@ -188,6 +195,32 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 
+	maxConc, err := envInt("FIRECRAWL_MAX_CONCURRENT_PER_KEY", 1)
+	if err != nil {
+		return Config{}, err
+	}
+	if maxConc < 0 {
+		return Config{}, fmt.Errorf("FIRECRAWL_MAX_CONCURRENT_PER_KEY must be >= 0, got %d", maxConc)
+	}
+	saturation := envStr("FIRECRAWL_CONCURRENCY_SATURATION", "queue")
+	if saturation != "queue" && saturation != "reject" {
+		return Config{}, fmt.Errorf("FIRECRAWL_CONCURRENCY_SATURATION %q must be \"queue\" or \"reject\"", saturation)
+	}
+	queueMs, err := envInt("FIRECRAWL_CONCURRENCY_QUEUE_MS", 15000)
+	if err != nil {
+		return Config{}, err
+	}
+	if queueMs < 0 {
+		return Config{}, fmt.Errorf("FIRECRAWL_CONCURRENCY_QUEUE_MS must be >= 0, got %d", queueMs)
+	}
+	retries403, err := envInt("FIRECRAWL_403_RETRIES", 1)
+	if err != nil {
+		return Config{}, err
+	}
+	if retries403 < 0 {
+		return Config{}, fmt.Errorf("FIRECRAWL_403_RETRIES must be >= 0, got %d", retries403)
+	}
+
 	return Config{
 		APIKeys:       keys,
 		Tavily:        tavily,
@@ -205,6 +238,10 @@ func LoadConfig() (Config, error) {
 		LowCreditThreshold: lowCredit,
 		StopCreditThreshold: stopCredit,
 		CreditRefreshSec:   refreshSec,
+		FirecrawlMaxConcurrentPerKey:   maxConc,
+		FirecrawlConcurrencySaturation: saturation,
+		FirecrawlConcurrencyQueueMs:    queueMs,
+		Firecrawl403Retries:            retries403,
 	}, nil
 }
 

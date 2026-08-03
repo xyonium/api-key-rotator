@@ -15,6 +15,14 @@ var rejectDenylist = regexp.MustCompile(`(?i)(insufficient credits?|rate limit|e
 // credits are genuinely gone (firecrawl profile only).
 var creditExhaustedPattern = regexp.MustCompile(`(?i)(insufficient credits?|payment required|exceeded)`)
 
+// concurrency429Pattern matches a Firecrawl 429 "concurrency limit reached"
+// message (as opposed to a per-minute "rate limit exceeded"). Used only for
+// observational logging - both kinds rotate to a different key regardless.
+var concurrency429Pattern = regexp.MustCompile(`(?i)(concurr\w*|browser limit)`)
+
+// isConcurrency429 reports whether a 429 body is the concurrency-limit variant.
+func isConcurrency429(body []byte) bool { return concurrency429Pattern.Match(body) }
+
 // firecrawlFailure reports whether body is a Firecrawl error envelope:
 // {"success":false, ...} OR a non-success status. A {"success":true,...}
 // response is NEVER a failure, even if its scraped data mentions "rate limit"

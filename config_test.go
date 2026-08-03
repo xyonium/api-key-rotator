@@ -9,7 +9,7 @@ import (
 
 func TestLoadConfig_defaults(t *testing.T) {
 	t.Setenv("FIRECRAWL_API_KEYS", "fc-a, fc-b ,, fc-c")
-	for _, k := range []string{"UPSTREAM", "PORT", "HOST", "MAX_PASSES", "MAX_BODY_BYTES", "PROXY_BASE_URL", "UPSTREAM_PROXY", "LOG_LEVEL", "CREDIT_RESET_DAY", "LOW_CREDIT_THRESHOLD", "STOP_CREDIT_THRESHOLD", "CREDIT_REFRESH_INTERVAL", "TAVILY_API_KEYS", "TAVILY_UPSTREAM", "TAVILY_ROUTE_PREFIX", "TAVILY_LOW_CREDIT_THRESHOLD", "TAVILY_STOP_CREDIT_THRESHOLD", "APIFY_API_KEYS", "APIFY_UPSTREAM", "APIFY_ROUTE_PREFIX", "APIFY_TIMEOUT_SEC", "APIFY_FREE_CREDIT_USD", "APIFY_LOW_CREDIT_USD", "APIFY_STOP_CREDIT_USD"} {
+	for _, k := range []string{"UPSTREAM", "PORT", "HOST", "MAX_PASSES", "MAX_BODY_BYTES", "PROXY_BASE_URL", "UPSTREAM_PROXY", "LOG_LEVEL", "CREDIT_RESET_DAY", "LOW_CREDIT_THRESHOLD", "STOP_CREDIT_THRESHOLD", "CREDIT_REFRESH_INTERVAL", "TAVILY_API_KEYS", "TAVILY_UPSTREAM", "TAVILY_ROUTE_PREFIX", "TAVILY_LOW_CREDIT_THRESHOLD", "TAVILY_STOP_CREDIT_THRESHOLD", "APIFY_API_KEYS", "APIFY_UPSTREAM", "APIFY_ROUTE_PREFIX", "APIFY_TIMEOUT_SEC", "APIFY_FREE_CREDIT_USD", "APIFY_LOW_CREDIT_USD", "APIFY_STOP_CREDIT_USD", "FIRECRAWL_MAX_CONCURRENT_PER_KEY", "FIRECRAWL_CONCURRENCY_SATURATION", "FIRECRAWL_CONCURRENCY_QUEUE_MS", "FIRECRAWL_403_RETRIES"} {
 		t.Setenv(k, "")
 	}
 	cfg, err := LoadConfig()
@@ -29,6 +29,10 @@ func TestLoadConfig_defaults(t *testing.T) {
 		LowCreditThreshold: 10,
 		StopCreditThreshold: 2,
 		CreditRefreshSec: 300,
+		FirecrawlMaxConcurrentPerKey: 1,
+		FirecrawlConcurrencySaturation: "queue",
+		FirecrawlConcurrencyQueueMs: 15000,
+		Firecrawl403Retries: 1,
 		Tavily: TavilyConfig{
 			APIKeys:     nil,
 			Upstream:    "https://api.tavily.com",
@@ -302,6 +306,66 @@ func TestLoadConfig_apifyBadUpstreamErrors(t *testing.T) {
 	t.Setenv("APIFY_UPSTREAM", "ftp://example.com")
 	if _, err := LoadConfig(); err == nil {
 		t.Fatal("expected error for APIFY_UPSTREAM=ftp://example.com, got nil")
+	}
+}
+
+func TestLoadConfig_concurrencyDefaults(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.FirecrawlMaxConcurrentPerKey != 1 {
+		t.Fatalf("FirecrawlMaxConcurrentPerKey = %d, want 1", cfg.FirecrawlMaxConcurrentPerKey)
+	}
+	if cfg.FirecrawlConcurrencySaturation != "queue" {
+		t.Fatalf("FirecrawlConcurrencySaturation = %q, want queue", cfg.FirecrawlConcurrencySaturation)
+	}
+	if cfg.FirecrawlConcurrencyQueueMs != 15000 {
+		t.Fatalf("FirecrawlConcurrencyQueueMs = %d, want 15000", cfg.FirecrawlConcurrencyQueueMs)
+	}
+	if cfg.Firecrawl403Retries != 1 {
+		t.Fatalf("Firecrawl403Retries = %d, want 1", cfg.Firecrawl403Retries)
+	}
+}
+
+func TestLoadConfig_concurrencyParsed(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	t.Setenv("FIRECRAWL_MAX_CONCURRENT_PER_KEY", "2")
+	t.Setenv("FIRECRAWL_CONCURRENCY_SATURATION", "reject")
+	t.Setenv("FIRECRAWL_CONCURRENCY_QUEUE_MS", "5000")
+	t.Setenv("FIRECRAWL_403_RETRIES", "0")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.FirecrawlMaxConcurrentPerKey != 2 {
+		t.Fatalf("FirecrawlMaxConcurrentPerKey = %d, want 2", cfg.FirecrawlMaxConcurrentPerKey)
+	}
+	if cfg.FirecrawlConcurrencySaturation != "reject" {
+		t.Fatalf("FirecrawlConcurrencySaturation = %q, want reject", cfg.FirecrawlConcurrencySaturation)
+	}
+	if cfg.FirecrawlConcurrencyQueueMs != 5000 {
+		t.Fatalf("FirecrawlConcurrencyQueueMs = %d, want 5000", cfg.FirecrawlConcurrencyQueueMs)
+	}
+	if cfg.Firecrawl403Retries != 0 {
+		t.Fatalf("Firecrawl403Retries = %d, want 0", cfg.Firecrawl403Retries)
+	}
+}
+
+func TestLoadConfig_concurrencyValidation(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	for _, kv := range [][2]string{
+		{"FIRECRAWL_MAX_CONCURRENT_PER_KEY", "-1"},
+		{"FIRECRAWL_CONCURRENCY_SATURATION", "bogus"},
+		{"FIRECRAWL_CONCURRENCY_QUEUE_MS", "-5"},
+		{"FIRECRAWL_403_RETRIES", "-2"},
+	} {
+		t.Setenv(kv[0], kv[1])
+		if _, err := LoadConfig(); err == nil {
+			t.Fatalf("expected error for %s=%q, got nil", kv[0], kv[1])
+		}
+		t.Setenv(kv[0], "")
 	}
 }
 

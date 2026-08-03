@@ -59,7 +59,11 @@ func buildServer() (*http.Server, error) {
 		"creditResetDay", cfg.CreditResetDay,
 		"lowCreditThreshold", cfg.LowCreditThreshold,
 		"stopCreditThreshold", cfg.StopCreditThreshold,
-		"creditRefreshSec", cfg.CreditRefreshSec)
+		"creditRefreshSec", cfg.CreditRefreshSec,
+		"fcMaxConcurrentPerKey", cfg.FirecrawlMaxConcurrentPerKey,
+		"fcConcurrencySaturation", cfg.FirecrawlConcurrencySaturation,
+		"fcConcurrencyQueueMs", cfg.FirecrawlConcurrencyQueueMs,
+		"fc403Retries", cfg.Firecrawl403Retries)
 
 	return &http.Server{
 		Addr:    cfg.Host + ":" + cfg.Port,

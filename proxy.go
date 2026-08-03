@@ -31,6 +31,65 @@ var backoffSchedule = []time.Duration{
 	8 * time.Second,
 }
 
+// rotResultKind classifies the outcome of one rotation attempt (serveOnce).
+type rotResultKind int
+
+const (
+	resOK        rotResultKind = iota // success; stop the loop and serve
+	resCapped                         // response body over MAX_BODY_BYTES; forward untouched
+	resRotate                         // shouldRotate; RecordRejection, maybe disable, Advance, continue
+	resNetErr                         // transient retries exhausted on the key; Advance, continue
+	resExhausted                      // Current() < 0 (all below stop / disabled) -> 503
+	resSaturated                      // usable keys exist but every in-flight slot is full -> queue/reject
+)
+
+type rotResult struct {
+	kind   rotResultKind
+	idx    int
+	key    string
+	status int
+	header http.Header
+	body   []byte
+}
+
+// serveOnce performs one rotation attempt: pick a key, acquire its in-flight
+// slot (released on EVERY path via defer), and classify the outcome. The slot
+// is held across the key's same-key backoff retries inside tryKey, then
+// released before any response writing or disable network calls.
+func (r *rotator) serveOnce(p *Profile, req *http.Request, inBody []byte, strippedPath string) rotResult {
+	idx, key := p.pool.Current()
+	if idx < 0 {
+		return rotResult{kind: resExhausted}
+	}
+	if !p.pool.TryAcquire(idx) {
+		return rotResult{kind: resSaturated, idx: idx, key: key}
+	}
+	defer p.pool.Release(idx)
+
+	// A key whose balance was never fetched is "unmeasured = plenty". Fetch
+	// it now (synchronously, once) so the real balance gates selection from
+	// the first request - this is what lets a near-empty token stop serving
+	// instead of burning through the month. No-op once measured.
+	if p.refresh != nil {
+		p.refresh.EnsureMeasured(idx)
+	}
+
+	status, header, body, capped, netErr := r.tryKey(req, p, idx, key, inBody, strippedPath)
+	if capped {
+		return rotResult{kind: resCapped, idx: idx, key: key, status: status, header: header, body: body}
+	}
+	if netErr {
+		return rotResult{kind: resNetErr, idx: idx, key: key, status: status, header: header, body: body}
+	}
+	if rotate, reason := p.shouldRotate(status, body); rotate {
+		if status == 429 && isConcurrency429(body) {
+			r.log.info("429 concurrency limit, rotating to a free-slot key", "profile", p.Name, "key", idx, "reason", reason)
+		}
+		return rotResult{kind: resRotate, idx: idx, key: key, status: status, header: header, body: body}
+	}
+	return rotResult{kind: resOK, idx: idx, key: key, status: status, header: header, body: body}
+}
+
 func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	p, strippedPath, ok := matchProfile(r.profiles, req.URL.Path)
 	if !ok {
@@ -53,73 +112,83 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	var overCap bool
 	var cleanBreak bool
 
-	for rotation := 0; rotation < maxRotations; rotation++ {
-		idx, key := p.pool.Current()
-		if idx < 0 {
-			// No key meets the stop-threshold (all credit-exhausted). Stop.
-			r.log.warn("no usable keys (all below stop credit threshold)", "profile", p.Name)
-			break
+	// Saturation policy (firecrawl): "queue" waits up to this long for a free
+	// slot across the whole request; "reject" fails fast.
+	saturation := p.ConcurrencySaturation
+	if saturation == "" {
+		saturation = "queue"
+	}
+	var queueDeadline time.Time
+	if saturation == "queue" && p.ConcurrencyQueue > 0 {
+		queueDeadline = time.Now().Add(p.ConcurrencyQueue)
+	}
+
+	for tries := 0; tries < maxRotations; {
+		res := r.serveOnce(p, req, inBody, strippedPath)
+
+		if res.kind == resSaturated {
+			if saturation == "reject" {
+				r.log.warn("all keys busy, rejecting", "profile", p.Name)
+				http.Error(w, `{"success":false,"error":"all keys busy","profile":"`+p.Name+`"}`, http.StatusTooManyRequests)
+				return
+			}
+			remaining := time.Until(queueDeadline)
+			if p.ConcurrencyQueue <= 0 || remaining <= 0 || !p.pool.WaitForSlot(req.Context(), remaining) {
+				if req.Context().Err() != nil {
+					return // client went away; don't write
+				}
+				r.log.warn("all keys busy, queue timeout", "profile", p.Name)
+				http.Error(w, `{"success":false,"error":"all keys busy, queue timeout","profile":"`+p.Name+`"}`, http.StatusServiceUnavailable)
+				return
+			}
+			continue // queued: a slot freed, retry WITHOUT consuming a rotation pass
 		}
 
-		// A key whose balance was never fetched is "unmeasured = plenty". Fetch
-		// it now (synchronously, once) so the real balance gates selection from
-		// the first request - this is what lets a near-empty token stop serving
-		// instead of burning through the month. No-op once measured.
-		if p.refresh != nil {
-			p.refresh.EnsureMeasured(idx)
-		}
+		tries++
+		lastStatus, lastHeader, lastBody = res.status, res.header, res.body
 
-		// Try this key, with exponential backoff on transient errors.
-		status, header, body, capped, netErr := r.tryKey(req, p, idx, key, inBody, strippedPath)
-
-		if capped {
-			lastStatus, lastHeader, lastBody, overCap = status, header, body, true
-			r.log.warn("response body over MAX_BODY_BYTES, forwarding untouched", "profile", p.Name, "key", idx)
+		switch res.kind {
+		case resOK:
+			p.pool.RecordSuccess(res.idx)
+			p.pool.Decrement(res.idx, extractCreditsUsed(res.body))
+			if p.refresh != nil {
+				p.refresh.MaybeRefreshLow(res.idx)
+			}
 			cleanBreak = true
-			break
-		}
-
-		// Transient errors exhausted their backoff on this key: rotate to the
-		// next key and try again (a different key may route differently).
-		if netErr {
-			lastStatus, lastHeader, lastBody = status, header, body
-			r.log.warn("transient errors exhausted on key, rotating", "profile", p.Name, "key", idx)
-			prev := idx
+		case resCapped:
+			overCap = true
+			cleanBreak = true
+			r.log.warn("response body over MAX_BODY_BYTES, forwarding untouched", "profile", p.Name, "key", res.idx)
+		case resNetErr:
+			r.log.warn("transient errors exhausted on key, rotating", "profile", p.Name, "key", res.idx)
+			prev := res.idx
 			p.pool.Advance()
 			if next, _ := p.pool.Current(); next >= 0 && p.refresh != nil {
 				p.refresh.OnSwitch(prev, next)
 			}
 			continue
+		case resRotate:
+			kind := rejectKind(res.status)
+			p.pool.RecordRejection(res.idx, kind)
+			r.log.info("rotating key", "profile", p.Name, "from", res.idx, "reason", "status "+strconv.Itoa(res.status), "masked", maskKey(res.key))
+			// Genuine credit exhaustion disables the key until its billing reset.
+			if p.isCreditExhausted(res.status, res.body) {
+				disableUntilReset(p, r.client, res.idx, res.key, time.Now().UTC(), r.log)
+				r.log.warn("key credit-disabled until reset", "profile", p.Name, "key", res.idx, "masked", maskKey(res.key))
+			}
+			prev := res.idx
+			p.pool.Advance()
+			if next, _ := p.pool.Current(); next >= 0 && next != prev && p.refresh != nil {
+				p.refresh.OnSwitch(prev, next)
+			}
+			continue
+		case resExhausted:
+			r.log.warn("no usable keys (all below stop credit threshold)", "profile", p.Name)
 		}
 
-		lastStatus, lastHeader, lastBody = status, header, body
-
-		rotate, reason := p.shouldRotate(status, body)
-		if !rotate {
-			// Success: record it, decrement predicted credits, maybe refresh.
-			p.pool.RecordSuccess(idx)
-			p.pool.Decrement(idx, extractCreditsUsed(body))
-			if p.refresh != nil {
-				p.refresh.MaybeRefreshLow(idx)
-			}
-			cleanBreak = true
+		if cleanBreak || res.kind == resExhausted {
 			break
 		}
-
-		kind := rejectKind(status)
-		p.pool.RecordRejection(idx, kind)
-		r.log.info("rotating key", "profile", p.Name, "from", idx, "reason", reason, "masked", maskKey(key))
-		// Genuine credit exhaustion disables the key until its billing reset.
-		if p.isCreditExhausted(status, body) {
-			disableUntilReset(p, r.client, idx, key, time.Now().UTC(), r.log)
-			r.log.warn("key credit-disabled until reset", "profile", p.Name, "key", idx, "masked", maskKey(key))
-		}
-		prev := idx
-		p.pool.Advance()
-		if next, _ := p.pool.Current(); next >= 0 && next != prev && p.refresh != nil {
-			p.refresh.OnSwitch(prev, next)
-		}
-		// loop continues with next key
 	}
 
 	if !cleanBreak {
@@ -221,8 +290,15 @@ func (r *rotator) tryKey(req *http.Request, p *Profile, idx int, key string, inB
 		}
 
 		if shouldRetry(resp.StatusCode, false) {
-			// transient status (403/5xx): backoff and retry SAME key
-			if attempt < len(backoffSchedule) {
+			// transient status (403/5xx): backoff and retry SAME key. A 403 gets
+			// a smaller budget (Firecrawl documents it as non-retryable - it's a
+			// permission/edge block, so hammering it 6x per key just churns);
+			// p.Max403Retries == 0 keeps the legacy full backoff.
+			budget := len(backoffSchedule)
+			if resp.StatusCode == 403 && p.Max403Retries > 0 && p.Max403Retries < budget {
+				budget = p.Max403Retries
+			}
+			if attempt < budget {
 				r.log.warn("transient upstream status, backing off", "profile", p.Name, "key", idx, "status", resp.StatusCode, "attempt", attempt+1)
 				if r.sleepOrCancel(req, backoffSchedule[attempt]) {
 					return resp.StatusCode, resp.Header, b, false, true

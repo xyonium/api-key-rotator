@@ -54,6 +54,10 @@ firecrawl:                     # your existing mcpo + firecrawl-mcp service
 | `LOW_CREDIT_THRESHOLD` | `10` | Switch off a key (rotate to the next) when its predicted `remainingCredits` drops to/below this. |
 | `STOP_CREDIT_THRESHOLD` | `2` | Stop accepting requests when every key is below this. Must be <= `LOW_CREDIT_THRESHOLD`. |
 | `CREDIT_REFRESH_INTERVAL` | `300` | Seconds; minimum interval between credit refreshes of a low-balance key. See "Credit-aware selection". |
+| `FIRECRAWL_MAX_CONCURRENT_PER_KEY` | `1` | Max in-flight requests on a single Firecrawl key. Free keys are ~2 concurrent browsers, so a sub-agent burst on one key would otherwise trigger 429 "concurrency limit reached". `0` = unlimited. See "Concurrency control" below. |
+| `FIRECRAWL_CONCURRENCY_SATURATION` | `queue` | What to do when every Firecrawl key is at its concurrency cap: `queue` (wait for a slot) or `reject` (return 429 immediately). |
+| `FIRECRAWL_CONCURRENCY_QUEUE_MS` | `15000` | How long a queued request waits for a free slot before returning 503. Capped per request, canceled if the client disconnects. |
+| `FIRECRAWL_403_RETRIES` | `1` | Same-key retries on a 403 before rotating. Firecrawl documents 403 as non-retryable (permission/edge block), so the default caps it at 1 retry (2 hits/key) instead of the legacy 5. `0` = legacy full backoff. |
 | `TAVILY_API_KEYS` | (unset) | Comma-separated Tavily key pool. When set, enables the Tavily profile. |
 | `TAVILY_UPSTREAM` | `https://api.tavily.com` | Upstream Tavily API base for the Tavily profile. |
 | `TAVILY_ROUTE_PREFIX` | `/tavily` | Route prefix that selects the Tavily profile. Stripped before forwarding. |
@@ -95,6 +99,34 @@ When the current key's predicted balance hits `LOW_CREDIT_THRESHOLD` (default
 When **every** key is below `STOP_CREDIT_THRESHOLD` (default 2), `/healthz`
 returns `503` and new requests return
 `503 {"success":false,"error":"all keys credit-exhausted until billing reset"}`.
+
+## Concurrency control (Firecrawl)
+
+Each Firecrawl key has a **concurrent-browser cap** (Free plan = 2). When
+OpenWebUI spins up a sub-agent it fires many scrapes at once; if they all land
+on one key, the upstream returns `429 "concurrency limit reached"`, and the old
+behavior (retry each key 5× then rotate) turned that into a churn storm that
+risks account flags. The rotator now **respects per-key concurrency**:
+
+- **Per-key in-flight cap** (`FIRECRAWL_MAX_CONCURRENT_PER_KEY`, default 1).
+  Key selection skips keys already at their cap, so a burst is spread across
+  the pool instead of piling onto one key. Each key is a separate account here,
+  so different keys have independent concurrency budgets.
+- **Saturation behavior** — when *every* usable key is busy:
+  `FIRECRAWL_CONCURRENCY_SATURATION=queue` (default) waits up to
+  `FIRECRAWL_CONCURRENCY_QUEUE_MS` (default 15s) for a slot to free, then
+  serves the request; `=reject` returns `429 {"error":"all keys busy"}`
+  immediately. Queued waits do not consume rotation passes and are canceled if
+  the client disconnects. On queue timeout the request gets
+  `503 {"error":"all keys busy, queue timeout"}`.
+- **429 "concurrency limit" rotates** to a key with a free slot (different
+  account = different budget). It never disables the key.
+- **403 retry is capped** (`FIRECRAWL_403_RETRIES`, default 1) because
+  Firecrawl documents 403 as non-retryable (permission/edge block) - retrying
+  it 5× per key was the main churn driver. It still never disables the key.
+
+These apply to the Firecrawl profile only; Tavily and Apify are unchanged
+(their pools run unlimited, as before).
 
 ## Rotation & retry behavior
 

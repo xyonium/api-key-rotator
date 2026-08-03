@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"math"
 	"sync"
 	"time"
@@ -48,6 +49,13 @@ type KeyPool struct {
 	// prefers a different key even when credits are equal. A key past its
 	// cooldown is eligible again.
 	cooldownUntil []time.Time
+	// maxConcurrent caps how many requests may be in-flight on a single key at
+	// once (0 = unlimited). inFlight[i] is the current count for key i. slotFree
+	// is a buffered size-1 wakeup token for WaitForSlot; it is only a hint -
+	// correctness comes from re-checking state under mu, never from the token.
+	maxConcurrent int
+	inFlight      []int
+	slotFree      chan struct{}
 }
 
 func NewKeyPool(keys []string) *KeyPool {
@@ -58,6 +66,8 @@ func NewKeyPool(keys []string) *KeyPool {
 		disabledUntil:    make([]time.Time, len(keys)),
 		remainingCredits: make([]int64, len(keys)),
 		cooldownUntil:    make([]time.Time, len(keys)),
+		inFlight:         make([]int, len(keys)),
+		slotFree:         make(chan struct{}, 1),
 	}
 	for i := range keys {
 		p.remainingCredits[i] = math.MaxInt64 // unmeasured
@@ -74,21 +84,123 @@ func (p *KeyPool) SetThresholds(low, stop int64) {
 	p.stopThreshold = stop
 }
 
+// SetMaxConcurrent caps in-flight requests per key. n <= 0 means unlimited
+// (the default for pools that never call this, e.g. tavily/apify).
+func (p *KeyPool) SetMaxConcurrent(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n < 0 {
+		n = 0
+	}
+	p.maxConcurrent = n
+}
+
+// hasSlotLocked reports whether key i has a free in-flight slot. Unlimited
+// pools always have a slot. Caller must hold mu.
+func (p *KeyPool) hasSlotLocked(i int) bool {
+	return p.maxConcurrent <= 0 || p.inFlight[i] < p.maxConcurrent
+}
+
+// anySlotFreeLocked reports whether any key has a free slot. Caller must hold mu.
+func (p *KeyPool) anySlotFreeLocked() bool {
+	for i := range p.keys {
+		if p.hasSlotLocked(i) {
+			return true
+		}
+	}
+	return false
+}
+
+// TryAcquire takes an in-flight slot on key index without blocking. Returns
+// false if the key is at its concurrency cap (nothing acquired). Unlimited
+// pools always succeed and do not count.
+func (p *KeyPool) TryAcquire(index int) bool {
+	if p.maxConcurrent <= 0 {
+		return true
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if index < 0 || index >= len(p.keys) || p.inFlight[index] >= p.maxConcurrent {
+		return false
+	}
+	p.inFlight[index]++
+	return true
+}
+
+// Release returns an in-flight slot on key index and wakes any WaitForSlot
+// waiters. Safe to call on invalid indexes and on over-release (guarded).
+func (p *KeyPool) Release(index int) {
+	if p.maxConcurrent <= 0 {
+		return
+	}
+	p.mu.Lock()
+	if index >= 0 && index < len(p.keys) && p.inFlight[index] > 0 {
+		p.inFlight[index]--
+	}
+	p.mu.Unlock()
+	// Wake one waiter (non-blocking; stale tokens are harmless).
+	select {
+	case p.slotFree <- struct{}{}:
+	default:
+	}
+}
+
+// WaitForSlot blocks until any key has a free in-flight slot, the timeout
+// elapses, or ctx is canceled. It never holds the pool mutex while waiting;
+// each wake re-checks state under mu so no wakeup is lost. Unlimited pools
+// return true immediately.
+func (p *KeyPool) WaitForSlot(ctx context.Context, timeout time.Duration) bool {
+	if p.maxConcurrent <= 0 {
+		return true
+	}
+	if timeout <= 0 {
+		p.mu.Lock()
+		ok := p.anySlotFreeLocked()
+		p.mu.Unlock()
+		return ok
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		p.mu.Lock()
+		if p.anySlotFreeLocked() {
+			p.mu.Unlock()
+			return true
+		}
+		ch := p.slotFree
+		p.mu.Unlock()
+		select {
+		case <-ch:
+			continue // re-check; another goroutine may have taken the slot
+		case <-timer.C:
+			return false
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
 // rotateCooldown is how long a just-rotated-off key is deprioritized, so equal-
 // credit keys actually take turns instead of the same one being re-picked.
 const rotateCooldown = 30 * time.Second
 
-// currentLocked picks the best usable key: among non-disabled keys with
-// remainingCredits >= stopThreshold, prefer those NOT in cooldown; within that
-// set pick the highest credits. If all eligible keys are in cooldown, fall back
-// to the highest-credit eligible key ignoring cooldown. Returns (-1,"") if none
-// meet the stop threshold or all are disabled.
+// currentLocked picks the best usable key in three tiers:
+//  1. has a free in-flight slot AND not in cooldown -> highest credits
+//  2. has a free slot, ignoring cooldown -> highest credits (existing fallback)
+//  3. any usable key, ignoring slot AND cooldown -> so that when EVERY usable
+//     key is saturated Current still returns a key (>= 0), letting the caller
+//     distinguish SATURATED (busy -> queue/reject) from EXHAUSTED (below stop
+//     or disabled -> -1 -> 503). With maxConcurrent == 0 (unlimited), tiers
+//     1-2 cover every usable key and the behavior is byte-for-byte the legacy
+//     two-tier selection.
 func (p *KeyPool) currentLocked() (int, string) {
 	now := time.Now()
 	best := -1
 	var bestCredits int64 = -1
-	fallback := -1
-	var fallbackCredits int64 = -1
+	fallbackSlot := -1
+	var fbSlotCredits int64 = -1
+	fallbackAny := -1
+	var fbAnyCredits int64 = -1
 	for i := range p.keys {
 		if p.disabled[i] {
 			continue
@@ -97,21 +209,33 @@ func (p *KeyPool) currentLocked() (int, string) {
 		if rc < p.stopThreshold {
 			continue
 		}
-		// Track the best ignoring cooldown as a fallback.
-		if rc > fallbackCredits {
-			fallbackCredits = rc
-			fallback = i
+		// Tier 3: any usable key, ignoring slot and cooldown.
+		if rc > fbAnyCredits {
+			fbAnyCredits = rc
+			fallbackAny = i
+		}
+		if !p.hasSlotLocked(i) {
+			continue
+		}
+		// Tier 2: free slot, ignoring cooldown.
+		if rc > fbSlotCredits {
+			fbSlotCredits = rc
+			fallbackSlot = i
 		}
 		if !p.cooldownUntil[i].IsZero() && now.Before(p.cooldownUntil[i]) {
-			continue // in cooldown: deprioritize
+			continue
 		}
+		// Tier 1: free slot AND not in cooldown.
 		if rc > bestCredits {
 			bestCredits = rc
 			best = i
 		}
 	}
 	if best < 0 {
-		best = fallback
+		best = fallbackSlot
+	}
+	if best < 0 {
+		best = fallbackAny
 	}
 	if best >= 0 {
 		p.cursor = best

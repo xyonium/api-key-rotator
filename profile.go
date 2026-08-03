@@ -30,6 +30,14 @@ type Profile struct {
 	// When 0, fetchApifyUsage uses the account's own limits.maxMonthlyUsageUsd.
 	// remaining = includedCredit - current.monthlyUsageUsd, tracked in cents.
 	ApifyFreeCreditUsd float64
+	// Concurrency control (firecrawl only; the other profiles leave these zero
+	// and behave as before). ConcurrencySaturation is "queue" or "reject";
+	// ConcurrencyQueue is how long a queued request waits for a free slot;
+	// Max403Retries caps same-key 403 retries before rotating (0 = legacy full
+	// backoff, used by tests).
+	ConcurrencySaturation string
+	ConcurrencyQueue      time.Duration
+	Max403Retries         int
 
 	pool    *KeyPool
 	refresh *Refresher
@@ -43,12 +51,16 @@ type Profile struct {
 func buildProfiles(cfg Config) []*Profile {
 	fcPool := NewKeyPool(cfg.APIKeys)
 	fcPool.SetThresholds(cfg.LowCreditThreshold, cfg.StopCreditThreshold)
+	fcPool.SetMaxConcurrent(cfg.FirecrawlMaxConcurrentPerKey)
 	profiles := []*Profile{{
 		Name:           "firecrawl",
 		Upstream:       cfg.Upstream,
 		UpstreamHost:   cfg.UpstreamHost,
 		CreditResetDay: cfg.CreditResetDay,
 		RewriteNext:    true,
+		ConcurrencySaturation: cfg.FirecrawlConcurrencySaturation,
+		ConcurrencyQueue:      time.Duration(cfg.FirecrawlConcurrencyQueueMs) * time.Millisecond,
+		Max403Retries:         cfg.Firecrawl403Retries,
 		pool:           fcPool,
 	}}
 

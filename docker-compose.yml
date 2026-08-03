@@ -13,6 +13,10 @@ services:
       STOP_CREDIT_THRESHOLD: "2"
       CREDIT_REFRESH_INTERVAL: "300"
       LOG_LEVEL: "info"
+      # FIRECRAWL_MAX_CONCURRENT_PER_KEY: "1"      # max in-flight per firecrawl key (0=unlimited)
+      # FIRECRAWL_CONCURRENCY_SATURATION: "queue"  # queue | reject when all keys busy
+      # FIRECRAWL_CONCURRENCY_QUEUE_MS: "15000"    # queued wait for a free slot before 503
+      # FIRECRAWL_403_RETRIES: "1"                 # same-key 403 retries before rotating
       # UPSTREAM_PROXY: "http://corp-proxy:3128"   # optional egress proxy
       # TAVILY_API_KEYS: "tvly-key1,tvly-key2"     # optional tavily profile
       # TAVILY_UPSTREAM: "https://api.tavily.com"

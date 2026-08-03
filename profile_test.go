@@ -245,6 +245,58 @@ func TestBuildProfiles_firecrawlOnly(t *testing.T) {
 	}
 }
 
+// TestBuildProfiles_firecrawlConcurrencyConfigured: the firecrawl pool gets
+// maxConcurrent from cfg and the Profile carries the saturation/403 settings;
+// tavily/apify pools stay unlimited (maxConcurrent 0).
+func TestBuildProfiles_firecrawlConcurrencyConfigured(t *testing.T) {
+	cfg := Config{
+		APIKeys:            []string{"fc-a"},
+		Upstream:           "https://api.firecrawl.dev",
+		UpstreamHost:       "api.firecrawl.dev",
+		LowCreditThreshold: 10,
+		StopCreditThreshold: 2,
+		FirecrawlMaxConcurrentPerKey:     2,
+		FirecrawlConcurrencySaturation:   "reject",
+		FirecrawlConcurrencyQueueMs:      8000,
+		Firecrawl403Retries:              1,
+		Tavily: TavilyConfig{
+			APIKeys:     []string{"tvly-a"},
+			Upstream:    "https://api.tavily.com",
+			RoutePrefix: "/tavily",
+			LowCredit:   10,
+			StopCredit:  2,
+		},
+	}
+	profiles := buildProfiles(cfg)
+	if len(profiles) != 2 {
+		t.Fatalf("len = %d, want 2", len(profiles))
+	}
+	fc := profiles[0]
+	fc.pool.mu.Lock()
+	mc := fc.pool.maxConcurrent
+	fc.pool.mu.Unlock()
+	if mc != 2 {
+		t.Fatalf("firecrawl pool maxConcurrent = %d, want 2", mc)
+	}
+	if fc.ConcurrencySaturation != "reject" {
+		t.Fatalf("firecrawl ConcurrencySaturation = %q, want reject", fc.ConcurrencySaturation)
+	}
+	if fc.ConcurrencyQueue != 8000*time.Millisecond {
+		t.Fatalf("firecrawl ConcurrencyQueue = %v, want 8s", fc.ConcurrencyQueue)
+	}
+	if fc.Max403Retries != 1 {
+		t.Fatalf("firecrawl Max403Retries = %d, want 1", fc.Max403Retries)
+	}
+	// Tavily pool must remain unlimited (no behavior change).
+	tv := profiles[1]
+	tv.pool.mu.Lock()
+	tvmc := tv.pool.maxConcurrent
+	tv.pool.mu.Unlock()
+	if tvmc != 0 {
+		t.Fatalf("tavily pool maxConcurrent = %d, want 0 (unlimited)", tvmc)
+	}
+}
+
 func TestBuildProfiles_withTavily(t *testing.T) {
 	cfg := Config{
 		APIKeys:            []string{"fc-a"},
