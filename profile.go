@@ -26,6 +26,9 @@ type Profile struct {
 	// UpstreamTimeout, when > 0, gives this profile its own HTTP client with
 	// this timeout (apify sync actor runs take 30-120s, beyond the shared 30s).
 	UpstreamTimeout time.Duration
+	// ApifyFreeCreditUsd is the plan's included monthly credit (apify only);
+	// remaining = FreeCreditUsd - current.monthlyUsageUsd, tracked in cents.
+	ApifyFreeCreditUsd float64
 
 	pool    *KeyPool
 	refresh *Refresher
@@ -68,24 +71,24 @@ func buildProfiles(cfg Config) []*Profile {
 
 	if len(cfg.Apify.APIKeys) > 0 {
 		apPool := NewKeyPool(cfg.Apify.APIKeys)
-		// Thresholds stay at the KeyPool defaults: with no usage endpoint every
-		// key is unmeasured (MaxInt64), so credit-based selection never engages;
-		// rotation is driven purely by rejections (402 disables, 401/429 cool).
+		// Apify credits are tracked in CENTS so sub-dollar stop thresholds are exact.
+		apPool.SetThresholds(cfg.Apify.LowCreditCents, cfg.Apify.StopCreditCents)
 		host := cfg.Apify.Upstream
 		if i := strings.Index(host, "://"); i >= 0 {
 			host = host[i+3:]
 		}
 		profiles = append(profiles, &Profile{
-			Name:            "apify",
-			RoutePrefix:     cfg.Apify.RoutePrefix,
-			Upstream:        cfg.Apify.Upstream,
-			UpstreamHost:    host,
-			CreditResetDay:  cfg.CreditResetDay,
-			RewriteNext:     false,
-			KeepPrefix:      true,
-			AuthQueryParam:  "token",
-			UpstreamTimeout: time.Duration(cfg.Apify.TimeoutSec) * time.Second,
-			pool:            apPool,
+			Name:               "apify",
+			RoutePrefix:        cfg.Apify.RoutePrefix,
+			Upstream:           cfg.Apify.Upstream,
+			UpstreamHost:       host,
+			CreditResetDay:     cfg.CreditResetDay,
+			RewriteNext:        false,
+			KeepPrefix:         true,
+			AuthQueryParam:     "token",
+			UpstreamTimeout:    time.Duration(cfg.Apify.TimeoutSec) * time.Second,
+			ApifyFreeCreditUsd: cfg.Apify.FreeCreditUsd,
+			pool:               apPool,
 		})
 	}
 	return profiles

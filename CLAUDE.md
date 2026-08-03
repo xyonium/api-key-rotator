@@ -18,9 +18,13 @@ prefix, and rotation policy.
   with the prefix **kept** (the real API lives under `/v2/acts`). Auth is the
   `?token=` **query param** (rotator replaces/adds it per attempt, drops any
   client `Authorization` header). Own HTTP client with `APIFY_TIMEOUT_SEC`
-  (default 180s) because sync actor runs take 30-120s. No usage endpoint, so
-  tokens stay unmeasured; 402 disables (CREDIT_RESET_DAY fallback), 401/429
-  cool down. Success is a bare dataset-items array - body is never scanned.
+  (default 180s) because sync actor runs take 30-120s. Balance comes from
+  `GET /v2/users/me/limits`: `remaining = APIFY_FREE_CREDIT_USD −
+  current.monthlyUsageUsd` in **cents**, with the real reset at
+  `monthlyUsageCycle.endAt` (billing anniversary, not the 1st). Auto-stops:
+  rotate off below `APIFY_LOW_CREDIT_USD` ($0.10), 503 when all below
+  `APIFY_STOP_CREDIT_USD` ($0.05). Success is a bare dataset-items array -
+  body is never scanned.
 
 The whole point: point firecrawl-mcp's `FIRECRAWL_API_URL` at this proxy and
 get key rotation with **zero changes** to firecrawl-mcp. Tavily works by
@@ -99,6 +103,8 @@ Key files and their roles:
 - **Credit-exhausted keys are disabled, not retried.** A genuine 402 / `success:false`+credits envelope disables the key until its reset instant (queried per-key via `/v2/team/credit-usage`); 429/401 rotate-but-keep. Disabling on rate-limit/auth would take a good key offline.
 - **Tavily rotates purely on status codes, never body text.** The Firecrawl denylist (body scanning on failure envelopes) is firecrawl-only. Tavily rejects are detected by status code (401/429 rotate, 432/433 disable), matching Tavily's documented behavior. Apify likewise: 401/429 rotate, 402 disables, status only - a success is a bare dataset-items array with no envelope to scan.
 - **Apify authenticates via `?token=` query param, not a header.** `tryKey` replaces/adds the param per attempt (`AuthQueryParam`) and drops any client `Authorization` header; the rest of the query string is preserved. Its route prefix is **kept** (`KeepPrefix`), and it gets its own `http.Client` with `APIFY_TIMEOUT_SEC` (default 180s) since sync actor runs take 30-120s.
+- **Apify balances are tracked in CENTS.** `fetchApifyUsage` reads `/v2/users/me/limits`: `remaining = (APIFY_FREE_CREDIT_USD − current.monthlyUsageUsd) × 100`, and the reset instant is `monthlyUsageCycle.endAt` (the billing anniversary). It deliberately does NOT use `limits.maxMonthlyUsageUsd` - that's the overage cap (0 on free), not the included credit. The pool's low/stop thresholds for apify are cents (`APIFY_LOW/STOP_CREDIT_USD` → cents), so sub-dollar auto-stop is exact.
+- **`EnsureMeasured` fetches a key's balance synchronously on the request path when it's still unmeasured** (`remainingCredits == MaxInt64`). This makes a real balance gate selection from the first request (so a near-empty apify token 503s immediately instead of serving blind at "unmeasured = plenty" until warm-up lands). No-op once measured; a failed fetch fails open (stays unmeasured).
 - **Predicted credits decrement between refreshes.** `Decrement` subtracts `creditsUsed` (or 1) on success so selection stays roughly correct without a refresh per request. Unmeasured keys (MaxInt64) are never decremented. `Refresher` corrects drift: on switch, when predicted < 100 (throttled), and daily.
 - **`Current()`/`Advance()` lock independently.** Concurrent requests can pick the same key; a per-request lock would serialize all upstream calls. This is deliberate. A good key is found within `MaxPasses` sweeps.
 - **`next`-URL rewriting is intentionally narrow.** Only `"next"` keys with absolute URLs on the upstream host are rewritten. Never broaden this - scraped content can legitimately contain the upstream host.

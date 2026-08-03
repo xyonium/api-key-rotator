@@ -61,6 +61,14 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			break
 		}
 
+		// A key whose balance was never fetched is "unmeasured = plenty". Fetch
+		// it now (synchronously, once) so the real balance gates selection from
+		// the first request - this is what lets a near-empty token stop serving
+		// instead of burning through the month. No-op once measured.
+		if p.refresh != nil {
+			p.refresh.EnsureMeasured(idx)
+		}
+
 		// Try this key, with exponential backoff on transient errors.
 		status, header, body, capped, netErr := r.tryKey(req, p, idx, key, inBody, strippedPath)
 

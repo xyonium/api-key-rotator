@@ -54,6 +54,8 @@ func buildServer() (*http.Server, error) {
 		"tavilyPrefix", cfg.Tavily.RoutePrefix,
 		"apifyKeys", len(cfg.Apify.APIKeys), "apifyUpstream", cfg.Apify.Upstream,
 		"apifyPrefix", cfg.Apify.RoutePrefix, "apifyTimeoutSec", cfg.Apify.TimeoutSec,
+		"apifyFreeCreditUsd", cfg.Apify.FreeCreditUsd,
+		"apifyLowCents", cfg.Apify.LowCreditCents, "apifyStopCents", cfg.Apify.StopCreditCents,
 		"creditResetDay", cfg.CreditResetDay,
 		"lowCreditThreshold", cfg.LowCreditThreshold,
 		"stopCreditThreshold", cfg.StopCreditThreshold,
