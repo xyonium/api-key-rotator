@@ -22,8 +22,8 @@ type Config struct {
 	UpstreamProxy string
 	LogLevel      string
 	CreditResetDay      int   // fallback reset day-of-month when /v2/team/credit-usage is unreachable; 1-31
-	LowCreditThreshold  int64 // switch off a key when its remainingCredits drops to/below this (default 10)
-	StopCreditThreshold int64 // stop accepting requests when every key is below this (default 2)
+	LowCreditThreshold  int64 // a measured key at/below this gets refreshed more often; selection is credit-maximizing so a below-low key only serves when it is the richest usable one (default 10)
+	StopCreditThreshold int64 // hard floor: a key below this never serves; 503 when every key is below it (default 2)
 	CreditRefreshSec    int   // seconds between background remainingCredits refreshes (default 300)
 	// Firecrawl per-key concurrency control (firecrawl profile only). See
 	// "Concurrent browser limits" in the Firecrawl docs: each free key is ~2
@@ -59,8 +59,8 @@ type ApifyConfig struct {
 	RoutePrefix      string
 	TimeoutSec       int     // upstream client timeout; sync actor runs take 30-120s
 	FreeCreditUsd    float64 // override for the included monthly credit; 0 = use the account's reported value
-	LowCreditCents   int64   // switch off a token below this remaining (default 10 = $0.10)
-	StopCreditCents  int64   // stop serving when every token is below this (default 5 = $0.05)
+	LowCreditCents   int64   // a measured token at/below this gets refreshed more often (default 10 = $0.10)
+	StopCreditCents  int64   // hard floor: a token below this never serves; 503 when all are below it (default 5 = $0.05)
 }
 
 func envStr(key, def string) string {

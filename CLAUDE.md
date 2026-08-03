@@ -21,10 +21,12 @@ prefix, and rotation policy.
   (default 180s) because sync actor runs take 30-120s. Balance comes from
   `GET /v2/users/me/limits`: `remaining = APIFY_FREE_CREDIT_USD −
   current.monthlyUsageUsd` in **cents**, with the real reset at
-  `monthlyUsageCycle.endAt` (billing anniversary, not the 1st). Auto-stops:
-  rotate off below `APIFY_LOW_CREDIT_USD` ($0.10), 503 when all below
-  `APIFY_STOP_CREDIT_USD` ($0.05). Success is a bare dataset-items array -
-  body is never scanned.
+  `monthlyUsageCycle.endAt` (billing anniversary, not the 1st). Thresholds:
+  selection is credit-maximizing (richest usable token wins, so a low token
+  is naturally avoided); `APIFY_LOW_CREDIT_USD` ($0.10) only triggers more
+  frequent balance re-checks; `APIFY_STOP_CREDIT_USD` ($0.05) is the hard
+  floor - 503 when every token is below it. Success is a bare dataset-items
+  array - body is never scanned.
 
 The whole point: point firecrawl-mcp's `FIRECRAWL_API_URL` at this proxy and
 get key rotation with **zero changes** to firecrawl-mcp. Tavily works by

@@ -183,7 +183,7 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			}
 			continue
 		case resExhausted:
-			r.log.warn("no usable keys (all below stop credit threshold)", "profile", p.Name)
+			r.log.warn("no usable keys (all below stop credit threshold)", "profile", p.Name, "keys", p.pool.Snapshot().Keys)
 		}
 
 		if cleanBreak || res.kind == resExhausted {
@@ -202,6 +202,7 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// If every key is credit-exhausted, return 503 with a clear message.
 	if idx, _ := p.pool.Current(); idx < 0 {
+		r.log.warn("503: no usable key, all credit-exhausted", "profile", p.Name, "keys", p.pool.Snapshot().Keys)
 		http.Error(w, `{"success":false,"error":"all keys credit-exhausted until billing reset","profile":"`+p.Name+`"}`, http.StatusServiceUnavailable)
 		return
 	}
