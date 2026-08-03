@@ -63,7 +63,7 @@ firecrawl:                     # your existing mcpo + firecrawl-mcp service
 | `APIFY_UPSTREAM` | `https://api.apify.com` | Upstream Apify API base. |
 | `APIFY_ROUTE_PREFIX` | `/v2/acts` | Route prefix that selects the Apify profile. **Kept** in the forwarded path (Apify's real API lives under `/v2/acts`). Note: this shadows those specific paths on the Firecrawl default profile; other `/v2/*` paths are unaffected. |
 | `APIFY_TIMEOUT_SEC` | `180` | Upstream client timeout for the Apify profile. Synchronous actor runs take 30-120s, so this must comfortably exceed `timeout=` in the request URL. |
-| `APIFY_FREE_CREDIT_USD` | `5` | The plan's **included** monthly credit in USD (free plan = 5). Used to compute remaining = `FREE_CREDIT_USD − current.monthlyUsageUsd`. NOT `maxMonthlyUsageUsd` (that's the overage cap, 0 on free). |
+| `APIFY_FREE_CREDIT_USD` | (unset = auto) | Override for the plan's **included** monthly credit. When unset, the rotator reads it fresh from the account's `limits.maxMonthlyUsageUsd` on every fetch (so a plan change is picked up automatically). Set it only to force a different value. remaining = `credit − current.monthlyUsageUsd`. |
 | `APIFY_LOW_CREDIT_USD` | `0.10` | Rotate off a token when its remaining balance drops below this. |
 | `APIFY_STOP_CREDIT_USD` | `0.05` | Stop serving (503) when every Apify token is below this, until the usage cycle resets. |
 | `LOG_LEVEL` | `info` | `debug` adds per-request lines. |
@@ -196,22 +196,25 @@ Apify. Requests whose path starts with `APIFY_ROUTE_PREFIX` (default
   retried on the same token with backoff like every profile.
 - **Credit / balance tracking (USD, in cents).** The proxy calls
   `GET /v2/users/me/limits?token=...` (read-only) and computes
-  `remaining = APIFY_FREE_CREDIT_USD − current.monthlyUsageUsd`, tracked in
-  cents so sub-dollar thresholds are exact. The real reset instant is
-  `monthlyUsageCycle.endAt` (the account's **billing anniversary**, not the
-  1st of the month), so a 402-disabled token re-enables exactly when the
-  free credit renews. If the limits call fails, it falls back to
-  `CREDIT_RESET_DAY`.
+  `remaining = includedCredit − current.monthlyUsageUsd`, tracked in cents
+  so sub-dollar thresholds are exact. The included credit is the account's
+  own `limits.maxMonthlyUsageUsd` read fresh each fetch (a plan upgrade is
+  picked up automatically), unless `APIFY_FREE_CREDIT_USD` overrides it. The
+  real reset instant is `monthlyUsageCycle.endAt` (the account's **billing
+  anniversary**, not the 1st of the month), so a 402-disabled token
+  re-enables exactly when the credit renews. If the limits call fails, it
+  falls back to `CREDIT_RESET_DAY`.
 - **Auto-stop near zero.** A token is rotated off when its remaining balance
   drops below `APIFY_LOW_CREDIT_USD` (default $0.10), and the whole profile
   returns `503` once every token is below `APIFY_STOP_CREDIT_USD` (default
   $0.05). The balance is measured on the first request and refreshed on
   rotation / when low / daily, so a token stops serving *before* it hits $0
   and comes back after the monthly reset - no manual intervention.
-- **Note on `maxMonthlyUsageUsd`:** the limits endpoint's
-  `limits.maxMonthlyUsageUsd` is the **overage cap** (0 on the free plan,
-  meaning "no overspend allowed"), not the included credit - so remaining is
-  computed from `APIFY_FREE_CREDIT_USD`, never from that field.
+- **Note on the included credit:** it comes from the account's
+  `limits.maxMonthlyUsageUsd` (the monthly usage cap reported by Apify), read
+  fresh every fetch. `APIFY_FREE_CREDIT_USD` exists only as an escape hatch to
+  force a different value (e.g. if the account's reported cap isn't the real
+  included credit).
 
 Client usage (no SDK, plain HTTP):
 

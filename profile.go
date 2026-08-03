@@ -26,8 +26,9 @@ type Profile struct {
 	// UpstreamTimeout, when > 0, gives this profile its own HTTP client with
 	// this timeout (apify sync actor runs take 30-120s, beyond the shared 30s).
 	UpstreamTimeout time.Duration
-	// ApifyFreeCreditUsd is the plan's included monthly credit (apify only);
-	// remaining = FreeCreditUsd - current.monthlyUsageUsd, tracked in cents.
+	// ApifyFreeCreditUsd overrides the included monthly credit (apify only).
+	// When 0, fetchApifyUsage uses the account's own limits.maxMonthlyUsageUsd.
+	// remaining = includedCredit - current.monthlyUsageUsd, tracked in cents.
 	ApifyFreeCreditUsd float64
 
 	pool    *KeyPool

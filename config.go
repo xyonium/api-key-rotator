@@ -41,14 +41,17 @@ type TavilyConfig struct {
 
 // ApifyConfig holds the Apify profile's settings. The profile is disabled
 // when APIKeys is empty. Credit tracking uses the /v2/users/me/limits endpoint:
-// remaining = (FreeCreditUsd - current.monthlyUsageUsd), tracked in CENTS so
-// sub-dollar balances (the auto-stop thresholds) are exact integers.
+// remaining = (includedMonthlyCredit - current.monthlyUsageUsd), tracked in
+// CENTS so sub-dollar balances (the auto-stop thresholds) are exact integers.
+// The included monthly credit is read from the account's own
+// limits.maxMonthlyUsageUsd on every fetch; FreeCreditUsd, when > 0, overrides
+// it (use when the account's reported cap isn't the real included credit).
 type ApifyConfig struct {
 	APIKeys          []string
 	Upstream         string
 	RoutePrefix      string
 	TimeoutSec       int     // upstream client timeout; sync actor runs take 30-120s
-	FreeCreditUsd    float64 // plan's included monthly credit (free plan: 5)
+	FreeCreditUsd    float64 // override for the included monthly credit; 0 = use the account's reported value
 	LowCreditCents   int64   // switch off a token below this remaining (default 10 = $0.10)
 	StopCreditCents  int64   // stop serving when every token is below this (default 5 = $0.05)
 }
@@ -258,12 +261,12 @@ func loadTavilyConfig(sharedLow, sharedStop int64) (TavilyConfig, error) {
 // runs (30-120s), so it defaults to 180 and must be positive.
 func loadApifyConfig() (ApifyConfig, error) {
 	a := ApifyConfig{
-		APIKeys:          parseKeys(os.Getenv("APIFY_API_KEYS")),
-		RoutePrefix:      envStr("APIFY_ROUTE_PREFIX", "/v2/acts"),
-		TimeoutSec:       180,
-		FreeCreditUsd:    5,
-		LowCreditCents:   10, // $0.10
-		StopCreditCents:  5,  // $0.05
+		APIKeys:         parseKeys(os.Getenv("APIFY_API_KEYS")),
+		RoutePrefix:     envStr("APIFY_ROUTE_PREFIX", "/v2/acts"),
+		TimeoutSec:      180,
+		FreeCreditUsd:   0, // 0 = no override: read the included credit from the account each fetch
+		LowCreditCents:  10, // $0.10
+		StopCreditCents: 5,  // $0.05
 	}
 
 	upstream := envStr("APIFY_UPSTREAM", "https://api.apify.com")

@@ -159,11 +159,13 @@ func fetchUsageFor(p *Profile, client *http.Client, key string, log *logger) usa
 }
 
 // fetchApifyUsage reads a token's balance from GET {upstream}/v2/users/me/limits
-// (read-only). Apify bills in USD against a monthly free/plan credit, so
-// remaining is computed as (FreeCreditUsd - current.monthlyUsageUsd) in CENTS,
-// and periodEnd is the real monthlyUsageCycle.endAt (the billing anniversary,
-// NOT the 1st of the month). Retries transient failures like the other
-// providers.
+// (read-only). Apify bills in USD against an included monthly credit, so
+// remaining is computed as (includedCredit - current.monthlyUsageUsd) in CENTS.
+// The included credit is the account's own limits.maxMonthlyUsageUsd (read
+// fresh each call, so a plan change is picked up automatically), unless
+// ApifyFreeCreditUsd > 0 overrides it. periodEnd is the real
+// monthlyUsageCycle.endAt (the billing anniversary, NOT the 1st of the month).
+// Retries transient failures like the other providers.
 func fetchApifyUsage(client *http.Client, p *Profile, key string, log *logger) usage {
 	const timeout = 5 * time.Second
 	c := client
@@ -216,6 +218,9 @@ func fetchApifyUsageOnce(c *http.Client, p *Profile, key string) (usage, string)
 				StartAt string `json:"startAt"`
 				EndAt   string `json:"endAt"`
 			} `json:"monthlyUsageCycle"`
+			Limits struct {
+				MaxMonthlyUsageUsd float64 `json:"maxMonthlyUsageUsd"`
+			} `json:"limits"`
 			Current struct {
 				MonthlyUsageUsd float64 `json:"monthlyUsageUsd"`
 			} `json:"current"`
@@ -224,8 +229,14 @@ func fetchApifyUsageOnce(c *http.Client, p *Profile, key string) (usage, string)
 	if err := json.Unmarshal(body, &env); err != nil {
 		return usage{}, "parse:" + err.Error()
 	}
+	// Included monthly credit: explicit override wins; otherwise use the
+	// account's reported value so a plan change is picked up automatically.
+	credit := p.ApifyFreeCreditUsd
+	if credit <= 0 {
+		credit = env.Data.Limits.MaxMonthlyUsageUsd
+	}
 	// remaining in cents; clamp at 0 when over the included credit.
-	remUsd := p.ApifyFreeCreditUsd - env.Data.Current.MonthlyUsageUsd
+	remUsd := credit - env.Data.Current.MonthlyUsageUsd
 	remCents := int64(math.Round(remUsd * 100))
 	if remCents < 0 {
 		remCents = 0

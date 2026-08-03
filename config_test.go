@@ -41,7 +41,7 @@ func TestLoadConfig_defaults(t *testing.T) {
 			Upstream:       "https://api.apify.com",
 			RoutePrefix:    "/v2/acts",
 			TimeoutSec:     180,
-			FreeCreditUsd:  5,
+			FreeCreditUsd:  0, // 0 = no override: use the account's own included monthly credit
 			LowCreditCents:  10,
 			StopCreditCents: 5,
 		},
@@ -250,8 +250,8 @@ func TestLoadConfig_apifyDefaultsWhenUnset(t *testing.T) {
 	if cfg.Apify.TimeoutSec != 180 {
 		t.Fatalf("Apify.TimeoutSec = %d, want 180 (sync actor runs take 30-120s)", cfg.Apify.TimeoutSec)
 	}
-	if cfg.Apify.FreeCreditUsd != 5 {
-		t.Fatalf("Apify.FreeCreditUsd = %v, want 5 (default free monthly credit)", cfg.Apify.FreeCreditUsd)
+	if cfg.Apify.FreeCreditUsd != 0 {
+		t.Fatalf("Apify.FreeCreditUsd = %v, want 0 (no override: use account's included credit)", cfg.Apify.FreeCreditUsd)
 	}
 	if cfg.Apify.LowCreditCents != 10 || cfg.Apify.StopCreditCents != 5 {
 		t.Fatalf("Apify thresholds = %d/%d cents, want 10/5 ($0.10/$0.05)", cfg.Apify.LowCreditCents, cfg.Apify.StopCreditCents)

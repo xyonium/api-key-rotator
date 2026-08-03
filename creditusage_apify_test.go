@@ -9,10 +9,18 @@ import (
 	"time"
 )
 
-// apifyLimitsBody builds a /v2/users/me/limits response body.
+// apifyLimitsBody builds a /v2/users/me/limits response body. The included
+// monthly credit is reported via limits.maxMonthlyUsageUsd (5 on this plan).
 func apifyLimitsBody(usageUsd float64, endAt string) string {
+	return apifyLimitsBodyCap(usageUsd, endAt, "5")
+}
+
+// apifyLimitsBodyCap is apifyLimitsBody with a configurable maxMonthlyUsageUsd
+// (the included monthly credit), so tests can prove the balance uses the
+// account-reported credit rather than a hardcoded 5.
+func apifyLimitsBodyCap(usageUsd float64, endAt, maxMonthlyUsageUsd string) string {
 	return `{"data":{"monthlyUsageCycle":{"startAt":"2026-08-01T00:00:00.000Z","endAt":"` + endAt + `"},` +
-		`"limits":{"maxMonthlyUsageUsd":0},` +
+		`"limits":{"maxMonthlyUsageUsd":` + maxMonthlyUsageUsd + `},` +
 		`"current":{"monthlyUsageUsd":` + jsonFloat(usageUsd) + `}}}`
 }
 
@@ -21,8 +29,10 @@ func jsonFloat(f float64) string {
 	return strconv.FormatFloat(f, 'f', -1, 64)
 }
 
-// TestFetchApifyUsage verifies remaining = (freeCredit - monthlyUsageUsd) in
-// CENTS, and periodEnd = monthlyUsageCycle.endAt.
+// TestFetchApifyUsage verifies remaining = (account's included monthly credit -
+// monthlyUsageUsd) in CENTS, and periodEnd = monthlyUsageCycle.endAt. With no
+// env override the included credit comes from the response's
+// limits.maxMonthlyUsageUsd (5 here).
 func TestFetchApifyUsage(t *testing.T) {
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v2/users/me/limits" {
@@ -38,18 +48,59 @@ func TestFetchApifyUsage(t *testing.T) {
 	}))
 	defer fake.Close()
 
-	p := &Profile{Name: "apify", Upstream: fake.URL, ApifyFreeCreditUsd: 5}
+	p := &Profile{Name: "apify", Upstream: fake.URL} // no override -> use account's credit
 	u := fetchApifyUsage(fake.Client(), p, "apify-a", nil)
 	if !u.ok {
 		t.Fatal("fetchApifyUsage failed")
 	}
-	// 5.00 - 4.93 = 0.07 USD = 7 cents
+	// account credit 5.00 (from response) - 4.93 = 0.07 USD = 7 cents
 	if u.remaining != 7 {
 		t.Fatalf("remaining = %d, want 7 cents (5.00 - 4.93)", u.remaining)
 	}
 	wantEnd, _ := time.Parse(time.RFC3339, "2026-09-01T23:59:59.999Z")
 	if !u.periodEnd.Equal(wantEnd) {
 		t.Fatalf("periodEnd = %v, want %v (monthlyUsageCycle.endAt)", u.periodEnd, wantEnd)
+	}
+}
+
+// TestFetchApifyUsage_UsesAccountCredit: with no env override, the included
+// monthly credit is read from the response's limits.maxMonthlyUsageUsd - so a
+// plan change is picked up automatically. Here the account reports 10, so
+// remaining = 10 - 4.93 = 5.07 = 507 cents (NOT 5 - 4.93).
+func TestFetchApifyUsage_UsesAccountCredit(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(apifyLimitsBodyCap(4.93, "2026-09-01T23:59:59.999Z", "10")))
+	}))
+	defer fake.Close()
+
+	p := &Profile{Name: "apify", Upstream: fake.URL} // no override
+	u := fetchApifyUsage(fake.Client(), p, "apify-a", nil)
+	if !u.ok {
+		t.Fatal("fetchApifyUsage failed")
+	}
+	if u.remaining != 507 {
+		t.Fatalf("remaining = %d, want 507 cents (10.00 account credit - 4.93)", u.remaining)
+	}
+}
+
+// TestFetchApifyUsage_EnvOverrideWins: an explicit APIFY_FREE_CREDIT_USD
+// override beats the account-reported credit.
+func TestFetchApifyUsage_EnvOverrideWins(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(apifyLimitsBodyCap(4.93, "2026-09-01T23:59:59.999Z", "10")))
+	}))
+	defer fake.Close()
+
+	p := &Profile{Name: "apify", Upstream: fake.URL, ApifyFreeCreditUsd: 5} // override 5 beats account's 10
+	u := fetchApifyUsage(fake.Client(), p, "apify-a", nil)
+	if !u.ok {
+		t.Fatal("fetchApifyUsage failed")
+	}
+	// override 5.00 - 4.93 = 0.07 = 7 cents (account's 10 ignored)
+	if u.remaining != 7 {
+		t.Fatalf("remaining = %d, want 7 cents (env override 5.00 - 4.93)", u.remaining)
 	}
 }
 

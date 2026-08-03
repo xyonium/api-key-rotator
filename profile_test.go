@@ -295,7 +295,7 @@ func TestBuildProfiles_withApify(t *testing.T) {
 			Upstream:         "https://api.apify.com",
 			RoutePrefix:      "/v2/acts",
 			TimeoutSec:       180,
-			FreeCreditUsd:    5,
+			FreeCreditUsd:    7.5, // explicit override flows through to the profile
 			LowCreditCents:   10,
 			StopCreditCents:  5,
 		},
@@ -317,8 +317,8 @@ func TestBuildProfiles_withApify(t *testing.T) {
 	if ap.UpstreamTimeout != 180*time.Second {
 		t.Fatalf("apify UpstreamTimeout = %v, want 180s", ap.UpstreamTimeout)
 	}
-	if ap.ApifyFreeCreditUsd != 5 {
-		t.Fatalf("apify ApifyFreeCreditUsd = %v, want 5", ap.ApifyFreeCreditUsd)
+	if ap.ApifyFreeCreditUsd != 7.5 {
+		t.Fatalf("apify ApifyFreeCreditUsd = %v, want 7.5 (override passthrough)", ap.ApifyFreeCreditUsd)
 	}
 	// Thresholds in cents flow into the pool: low 10, stop 5.
 	ap.pool.mu.Lock()
