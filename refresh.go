@@ -8,10 +8,13 @@ import (
 
 // lowRefreshThreshold is the predicted-credit level below which a key is
 // refreshed more often (every r.lowInterval) instead of only on switch or
-// daily. Matches the user's "< 100 -> every few minutes" rule.
+// daily. Matches the user's "< 100 -> every few minutes" rule. For apify the
+// pool tracks CENTS, so 100 credits would mean $1.00 - too coarse; apify uses
+// its own cent-denominated threshold derived from its low-water mark.
 const (
-	lowRefreshThreshold = 100
-	dailyRefresh        = 24 * time.Hour
+	lowRefreshThreshold      = 100
+	apifyLowRefreshCents     = 100 // $1.00: re-check a low apify balance often
+	dailyRefresh             = 24 * time.Hour
 )
 
 // Refresher applies the on-demand credit-refresh strategy to a KeyPool:
@@ -64,8 +67,18 @@ func (r *Refresher) OnSwitch(fromIdx, toIdx int) {
 	}()
 }
 
+// lowMark is the predicted-balance level below which MaybeRefreshLow kicks in.
+// Apify tracks cents, so it needs a cent-denominated mark; other profiles use
+// the shared credit mark.
+func (r *Refresher) lowMark() int64 {
+	if r.profile != nil && r.profile.Name == "apify" {
+		return apifyLowRefreshCents
+	}
+	return lowRefreshThreshold
+}
+
 // MaybeRefreshLow refreshes a key in the background if its PREDICTED remaining
-// is below lowRefreshThreshold and it hasn't been refreshed in lowInterval.
+// is below the low-water mark and it hasn't been refreshed in lowInterval.
 // Called by the rotator after each successful response.
 func (r *Refresher) MaybeRefreshLow(idx int) {
 	if r == nil || idx < 0 || idx >= len(r.keys) {
@@ -73,7 +86,7 @@ func (r *Refresher) MaybeRefreshLow(idx int) {
 	}
 	// Check predicted balance without holding the refresher lock.
 	predicted := r.profile.pool.Snapshot().Keys[idx].RemainingCredits // -1 = unmeasured
-	if predicted < 0 || predicted >= lowRefreshThreshold {
+	if predicted < 0 || predicted >= r.lowMark() {
 		return
 	}
 	r.mu.Lock()
@@ -135,6 +148,22 @@ func (r *Refresher) RefreshAll() int {
 		}
 	}
 	return unmeasured
+}
+
+// EnsureMeasured synchronously refreshes key idx only if it is currently
+// unmeasured (no balance ever fetched). Called on the request path so a key's
+// real balance gates selection from the first request, instead of serving
+// blind at "unmeasured = plenty" until the background warm-up lands. A
+// successful fetch marks the key fresh for the daily loop; a failed fetch
+// leaves it unmeasured (fail-open) without tripping the low-refresh throttle.
+func (r *Refresher) EnsureMeasured(idx int) {
+	if r == nil || idx < 0 || idx >= len(r.keys) {
+		return
+	}
+	if r.profile.pool.Snapshot().Keys[idx].RemainingCredits >= 0 {
+		return // already measured
+	}
+	r.refreshOne(idx)
 }
 
 // refreshOne fetches one key's live usage and applies it. Updates lastDaily so

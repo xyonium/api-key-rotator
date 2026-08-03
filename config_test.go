@@ -9,7 +9,7 @@ import (
 
 func TestLoadConfig_defaults(t *testing.T) {
 	t.Setenv("FIRECRAWL_API_KEYS", "fc-a, fc-b ,, fc-c")
-	for _, k := range []string{"UPSTREAM", "PORT", "HOST", "MAX_PASSES", "MAX_BODY_BYTES", "PROXY_BASE_URL", "UPSTREAM_PROXY", "LOG_LEVEL", "CREDIT_RESET_DAY", "LOW_CREDIT_THRESHOLD", "STOP_CREDIT_THRESHOLD", "CREDIT_REFRESH_INTERVAL", "TAVILY_API_KEYS", "TAVILY_UPSTREAM", "TAVILY_ROUTE_PREFIX", "TAVILY_LOW_CREDIT_THRESHOLD", "TAVILY_STOP_CREDIT_THRESHOLD", "APIFY_API_KEYS", "APIFY_UPSTREAM", "APIFY_ROUTE_PREFIX", "APIFY_TIMEOUT_SEC"} {
+	for _, k := range []string{"UPSTREAM", "PORT", "HOST", "MAX_PASSES", "MAX_BODY_BYTES", "PROXY_BASE_URL", "UPSTREAM_PROXY", "LOG_LEVEL", "CREDIT_RESET_DAY", "LOW_CREDIT_THRESHOLD", "STOP_CREDIT_THRESHOLD", "CREDIT_REFRESH_INTERVAL", "TAVILY_API_KEYS", "TAVILY_UPSTREAM", "TAVILY_ROUTE_PREFIX", "TAVILY_LOW_CREDIT_THRESHOLD", "TAVILY_STOP_CREDIT_THRESHOLD", "APIFY_API_KEYS", "APIFY_UPSTREAM", "APIFY_ROUTE_PREFIX", "APIFY_TIMEOUT_SEC", "APIFY_FREE_CREDIT_USD", "APIFY_LOW_CREDIT_USD", "APIFY_STOP_CREDIT_USD"} {
 		t.Setenv(k, "")
 	}
 	cfg, err := LoadConfig()
@@ -37,10 +37,13 @@ func TestLoadConfig_defaults(t *testing.T) {
 			StopCredit:  2,
 		},
 		Apify: ApifyConfig{
-			APIKeys:     nil,
-			Upstream:    "https://api.apify.com",
-			RoutePrefix: "/v2/acts",
-			TimeoutSec:  180,
+			APIKeys:        nil,
+			Upstream:       "https://api.apify.com",
+			RoutePrefix:    "/v2/acts",
+			TimeoutSec:     180,
+			FreeCreditUsd:  5,
+			LowCreditCents:  10,
+			StopCreditCents: 5,
 		},
 	}
 	if !reflect.DeepEqual(cfg, want) {
@@ -247,6 +250,12 @@ func TestLoadConfig_apifyDefaultsWhenUnset(t *testing.T) {
 	if cfg.Apify.TimeoutSec != 180 {
 		t.Fatalf("Apify.TimeoutSec = %d, want 180 (sync actor runs take 30-120s)", cfg.Apify.TimeoutSec)
 	}
+	if cfg.Apify.FreeCreditUsd != 5 {
+		t.Fatalf("Apify.FreeCreditUsd = %v, want 5 (default free monthly credit)", cfg.Apify.FreeCreditUsd)
+	}
+	if cfg.Apify.LowCreditCents != 10 || cfg.Apify.StopCreditCents != 5 {
+		t.Fatalf("Apify thresholds = %d/%d cents, want 10/5 ($0.10/$0.05)", cfg.Apify.LowCreditCents, cfg.Apify.StopCreditCents)
+	}
 }
 
 func TestLoadConfig_apifyKeysParsed(t *testing.T) {
@@ -293,5 +302,48 @@ func TestLoadConfig_apifyBadUpstreamErrors(t *testing.T) {
 	t.Setenv("APIFY_UPSTREAM", "ftp://example.com")
 	if _, err := LoadConfig(); err == nil {
 		t.Fatal("expected error for APIFY_UPSTREAM=ftp://example.com, got nil")
+	}
+}
+
+func TestLoadConfig_apifyCreditThresholdsParsed(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	t.Setenv("APIFY_API_KEYS", "apify-a")
+	t.Setenv("APIFY_FREE_CREDIT_USD", "10")
+	t.Setenv("APIFY_LOW_CREDIT_USD", "0.25")
+	t.Setenv("APIFY_STOP_CREDIT_USD", "0.10")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Apify.FreeCreditUsd != 10 {
+		t.Fatalf("Apify.FreeCreditUsd = %v, want 10", cfg.Apify.FreeCreditUsd)
+	}
+	// USD floats are converted to integer cents: 0.25 -> 25, 0.10 -> 10.
+	if cfg.Apify.LowCreditCents != 25 || cfg.Apify.StopCreditCents != 10 {
+		t.Fatalf("Apify thresholds = %d/%d cents, want 25/10", cfg.Apify.LowCreditCents, cfg.Apify.StopCreditCents)
+	}
+}
+
+func TestLoadConfig_apifyBadCreditThresholdsError(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	t.Setenv("APIFY_API_KEYS", "apify-a")
+	for _, kv := range [][2]string{
+		{"APIFY_FREE_CREDIT_USD", "abc"},
+		{"APIFY_FREE_CREDIT_USD", "-1"},
+		{"APIFY_LOW_CREDIT_USD", "-0.5"},
+		{"APIFY_STOP_CREDIT_USD", "xyz"},
+	} {
+		t.Setenv(kv[0], kv[1])
+		if _, err := LoadConfig(); err == nil {
+			t.Fatalf("expected error for %s=%q, got nil", kv[0], kv[1])
+		}
+		// reset to a valid value for the next iteration
+		t.Setenv(kv[0], "")
+	}
+	// stop above low must error
+	t.Setenv("APIFY_LOW_CREDIT_USD", "0.05")
+	t.Setenv("APIFY_STOP_CREDIT_USD", "0.20")
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("expected error when APIFY_STOP > APIFY_LOW, got nil")
 	}
 }

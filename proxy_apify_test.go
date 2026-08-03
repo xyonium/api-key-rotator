@@ -10,10 +10,17 @@ import (
 )
 
 // apifyTestRotator builds a rotator with firecrawl (default, fcFake) and apify
-// (/v2/acts, apifyFake) profiles, mirroring tavilyTestRotator.
+// (/v2/acts, apifyFake) profiles, mirroring tavilyTestRotator. The apify
+// profile gets a refresher so EnsureMeasured can fetch real balances; its
+// limits responses come from the fake's /v2/users/me/limits branch.
 func apifyTestRotator(cfg Config, fcPool, apPool *KeyPool, client *http.Client, fcUpstream, apifyUpstream string) *rotator {
 	fcPool.SetThresholds(cfg.LowCreditThreshold, cfg.StopCreditThreshold)
-	apPool.SetThresholds(cfg.LowCreditThreshold, cfg.StopCreditThreshold)
+	// Apify tracks cents; pull its thresholds from cfg.Apify (default 10/5).
+	apLow, apStop := cfg.Apify.LowCreditCents, cfg.Apify.StopCreditCents
+	if apLow == 0 && apStop == 0 {
+		apLow, apStop = 10, 5
+	}
+	apPool.SetThresholds(apLow, apStop)
 	host := func(u string) string {
 		if i := strings.Index(u, "://"); i >= 0 {
 			return u[i+3:]
@@ -21,13 +28,33 @@ func apifyTestRotator(cfg Config, fcPool, apPool *KeyPool, client *http.Client, 
 		return u
 	}
 	fc := &Profile{Name: "firecrawl", Upstream: fcUpstream, UpstreamHost: host(fcUpstream), CreditResetDay: cfg.CreditResetDay, RewriteNext: true, pool: fcPool}
-	ap := &Profile{Name: "apify", RoutePrefix: "/v2/acts", Upstream: apifyUpstream, UpstreamHost: host(apifyUpstream), CreditResetDay: cfg.CreditResetDay, KeepPrefix: true, AuthQueryParam: "token", pool: apPool}
-	return newRotator(cfg, []*Profile{fc, ap}, client, newLogger("info"))
+	freeUsd := cfg.Apify.FreeCreditUsd
+	if freeUsd == 0 {
+		freeUsd = 5
+	}
+	ap := &Profile{Name: "apify", RoutePrefix: "/v2/acts", Upstream: apifyUpstream, UpstreamHost: host(apifyUpstream), CreditResetDay: cfg.CreditResetDay, KeepPrefix: true, AuthQueryParam: "token", ApifyFreeCreditUsd: freeUsd, pool: apPool}
+	r := newRotator(cfg, []*Profile{fc, ap}, client, newLogger("info"))
+	ap.refresh = NewRefresher(ap, client, cfg, newLogger("info"))
+	return r
+}
+
+// apifyLimitsHandler routes /v2/users/me/limits to a 200 with the given usage
+// USD; everything else to the actor handler. Shared by tests that need a real
+// balance refresh to succeed.
+func apifyLimitsHandler(usageUsd, endAt string, actor http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/users/me/limits" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"monthlyUsageCycle":{"startAt":"2026-08-01T00:00:00.000Z","endAt":"` + endAt + `"},"limits":{"maxMonthlyUsageUsd":0},"current":{"monthlyUsageUsd":` + usageUsd + `}}}`))
+			return
+		}
+		actor(w, r)
+	}
 }
 
 func TestRotator_ApifyTokenQueryParamReplaced(t *testing.T) {
 	var gotPath, gotQuery, gotAuth, gotBody string
-	apifyFake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	apifyFake := httptest.NewServer(apifyLimitsHandler("1.00", "2026-09-01T23:59:59.999Z", func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotQuery = r.URL.RawQuery
 		gotAuth = r.Header.Get("Authorization")
@@ -73,7 +100,7 @@ func TestRotator_ApifyTokenQueryParamReplaced(t *testing.T) {
 
 func TestRotator_ApifyTokenAddedWhenMissing(t *testing.T) {
 	var gotQuery string
-	apifyFake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	apifyFake := httptest.NewServer(apifyLimitsHandler("1.00", "2026-09-01T23:59:59.999Z", func(w http.ResponseWriter, r *http.Request) {
 		gotQuery = r.URL.RawQuery
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[]`))
@@ -99,6 +126,11 @@ func TestRotator_ApifyTokenAddedWhenMissing(t *testing.T) {
 func TestRotator_ApifyRotatesOn402AndDisables(t *testing.T) {
 	var callsA, callsB atomic.Int32
 	apifyFake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/users/me/limits" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"monthlyUsageCycle":{"startAt":"2026-08-01T00:00:00.000Z","endAt":"2026-09-01T23:59:59.999Z"},"limits":{"maxMonthlyUsageUsd":0},"current":{"monthlyUsageUsd":5.0}}}`))
+			return
+		}
 		switch r.URL.Query().Get("token") {
 		case "apify-a":
 			callsA.Add(1)
@@ -136,7 +168,7 @@ func TestRotator_ApifyRotatesOn402AndDisables(t *testing.T) {
 }
 
 func TestRotator_Apify429RotatesButKeepsKey(t *testing.T) {
-	apifyFake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	apifyFake := httptest.NewServer(apifyLimitsHandler("1.00", "2026-09-01T23:59:59.999Z", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("token") == "apify-a" {
 			w.WriteHeader(429)
 			return
@@ -165,9 +197,10 @@ func TestRotator_Apify429RotatesButKeepsKey(t *testing.T) {
 func TestRotator_ApifySuccessArrayDoesNotRotate(t *testing.T) {
 	// Apify success is a bare JSON ARRAY of dataset items, often containing
 	// scraped text with denylist words. Must not rotate, and the body must be
-	// forwarded untouched.
+	// forwarded untouched. The pool starts UNMEASURED and the balance refresh
+	// reports 400 cents; success then decrements by exactly 1 credit.
 	var calls atomic.Int32
-	apifyFake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	apifyFake := httptest.NewServer(apifyLimitsHandler("1.00", "2026-09-01T23:59:59.999Z", func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[{"text":"rate limit exceeded in the news"}]`))
@@ -177,9 +210,7 @@ func TestRotator_ApifySuccessArrayDoesNotRotate(t *testing.T) {
 	defer fcFake.Close()
 
 	cfg := cfgFor(fcFake)
-	apPool := NewKeyPool([]string{"apify-a", "apify-b"})
-	apPool.SetCredits(0, 50)
-	apPool.SetCredits(1, 50)
+	apPool := NewKeyPool([]string{"apify-a", "apify-b"}) // unmeasured
 	r := apifyTestRotator(cfg, NewKeyPool(cfg.APIKeys), apPool, http.DefaultClient, fcFake.URL, apifyFake.URL)
 
 	rec := post(t, r, "/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
@@ -192,13 +223,19 @@ func TestRotator_ApifySuccessArrayDoesNotRotate(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "rate limit exceeded") {
 		t.Fatalf("body = %q, want array forwarded verbatim", rec.Body.String())
 	}
-	if got := apPool.Snapshot().Keys[0].RemainingCredits; got != 49 {
-		t.Fatalf("remaining = %d, want 49 (decrement by 1 on success)", got)
+	// 5.00 free - 1.00 used = 400 cents refreshed; minus 1 credit on success.
+	if got := apPool.Snapshot().Keys[0].RemainingCredits; got != 399 {
+		t.Fatalf("remaining = %d, want 399 (400 refreshed - 1 success)", got)
 	}
 }
 
 func TestRotator_ApifyDisableUsesFallbackReset(t *testing.T) {
+	// The limits endpoint 404s, so the disable must fall back to CREDIT_RESET_DAY.
 	apifyFake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/users/me/limits" {
+			w.WriteHeader(404)
+			return
+		}
 		w.WriteHeader(402)
 	}))
 	defer apifyFake.Close()
@@ -216,7 +253,7 @@ func TestRotator_ApifyDisableUsesFallbackReset(t *testing.T) {
 	if !k.Disabled {
 		t.Fatal("key should be disabled after 402")
 	}
-	// Apify has no usage endpoint: reset is the CREDIT_RESET_DAY fallback.
+	// Limits endpoint unreachable: reset is the CREDIT_RESET_DAY fallback.
 	if k.DisabledUntil.Day() != 15 {
 		t.Fatalf("DisabledUntil = %v, want day 15 (CREDIT_RESET_DAY fallback)", k.DisabledUntil)
 	}
@@ -225,14 +262,16 @@ func TestRotator_ApifyDisableUsesFallbackReset(t *testing.T) {
 	}
 }
 
-func TestRotator_ApifyNoCreditUsageFetch(t *testing.T) {
-	// The apify profile has no usage endpoint: disabling a key must not call
-	// any credit-usage URL on the apify upstream (firecrawl would call
-	// /v2/team/credit-usage here).
-	var creditUsageCalls atomic.Int32
+func TestRotator_ApifyDisableQueriesLimitsEndpoint(t *testing.T) {
+	// Disabling a key must query the apify limits endpoint for the real reset
+	// instant (unlike before, when apify had no usage call at all).
+	var limitsCalls atomic.Int32
 	apifyFake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "credit-usage") || r.URL.Path == "/usage" {
-			creditUsageCalls.Add(1)
+		if r.URL.Path == "/v2/users/me/limits" {
+			limitsCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"monthlyUsageCycle":{"startAt":"2026-08-01T00:00:00.000Z","endAt":"2026-09-01T23:59:59.999Z"},"limits":{"maxMonthlyUsageUsd":0},"current":{"monthlyUsageUsd":5.0}}}`))
+			return
 		}
 		w.WriteHeader(402)
 	}))
@@ -246,7 +285,10 @@ func TestRotator_ApifyNoCreditUsageFetch(t *testing.T) {
 	r := apifyTestRotator(cfg, NewKeyPool(cfg.APIKeys), apPool, http.DefaultClient, fcFake.URL, apifyFake.URL)
 
 	post(t, r, "/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
-	if creditUsageCalls.Load() != 0 {
-		t.Fatalf("credit-usage calls on apify upstream = %d, want 0", creditUsageCalls.Load())
+	if limitsCalls.Load() != 1 {
+		t.Fatalf("limits endpoint calls = %d, want 1 (disable should fetch real reset)", limitsCalls.Load())
+	}
+	if !apPool.Snapshot().Keys[0].Disabled {
+		t.Fatal("key should be disabled after 402")
 	}
 }

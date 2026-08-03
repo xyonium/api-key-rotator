@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"strconv"
@@ -39,14 +40,17 @@ type TavilyConfig struct {
 }
 
 // ApifyConfig holds the Apify profile's settings. The profile is disabled
-// when APIKeys is empty. There are no credit thresholds: Apify exposes no
-// cheap usage endpoint, so its keys stay "unmeasured" and rotation is purely
-// rejection-driven (402 disables, 401/429 cool down).
+// when APIKeys is empty. Credit tracking uses the /v2/users/me/limits endpoint:
+// remaining = (FreeCreditUsd - current.monthlyUsageUsd), tracked in CENTS so
+// sub-dollar balances (the auto-stop thresholds) are exact integers.
 type ApifyConfig struct {
-	APIKeys     []string
-	Upstream    string
-	RoutePrefix string
-	TimeoutSec  int // upstream client timeout; sync actor runs take 30-120s
+	APIKeys          []string
+	Upstream         string
+	RoutePrefix      string
+	TimeoutSec       int     // upstream client timeout; sync actor runs take 30-120s
+	FreeCreditUsd    float64 // plan's included monthly credit (free plan: 5)
+	LowCreditCents   int64   // switch off a token below this remaining (default 10 = $0.10)
+	StopCreditCents  int64   // stop serving when every token is below this (default 5 = $0.05)
 }
 
 func envStr(key, def string) string {
@@ -254,9 +258,12 @@ func loadTavilyConfig(sharedLow, sharedStop int64) (TavilyConfig, error) {
 // runs (30-120s), so it defaults to 180 and must be positive.
 func loadApifyConfig() (ApifyConfig, error) {
 	a := ApifyConfig{
-		APIKeys:     parseKeys(os.Getenv("APIFY_API_KEYS")),
-		RoutePrefix: envStr("APIFY_ROUTE_PREFIX", "/v2/acts"),
-		TimeoutSec:  180,
+		APIKeys:          parseKeys(os.Getenv("APIFY_API_KEYS")),
+		RoutePrefix:      envStr("APIFY_ROUTE_PREFIX", "/v2/acts"),
+		TimeoutSec:       180,
+		FreeCreditUsd:    5,
+		LowCreditCents:   10, // $0.10
+		StopCreditCents:  5,  // $0.05
 	}
 
 	upstream := envStr("APIFY_UPSTREAM", "https://api.apify.com")
@@ -280,7 +287,53 @@ func loadApifyConfig() (ApifyConfig, error) {
 		}
 		a.TimeoutSec = n
 	}
+
+	freeUsd, err := envUsd("APIFY_FREE_CREDIT_USD", a.FreeCreditUsd)
+	if err != nil {
+		return ApifyConfig{}, err
+	}
+	a.FreeCreditUsd = freeUsd
+
+	low, err := envUsdCents("APIFY_LOW_CREDIT_USD", a.LowCreditCents)
+	if err != nil {
+		return ApifyConfig{}, err
+	}
+	stop, err := envUsdCents("APIFY_STOP_CREDIT_USD", a.StopCreditCents)
+	if err != nil {
+		return ApifyConfig{}, err
+	}
+	if stop > low {
+		return ApifyConfig{}, fmt.Errorf("APIFY_STOP_CREDIT_USD (%d cents) must be <= APIFY_LOW_CREDIT_USD (%d cents)", stop, low)
+	}
+	a.LowCreditCents, a.StopCreditCents = low, stop
 	return a, nil
+}
+
+// envUsd parses a non-negative USD amount from an env var, returning def when unset.
+func envUsd(key string, def float64) (float64, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative number (USD), got %q", key, v)
+	}
+	return f, nil
+}
+
+// envUsdCents parses a USD amount from an env var into integer cents (rounded
+// to the nearest cent), returning def (already in cents) when unset.
+func envUsdCents(key string, defCents int64) (int64, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return defCents, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative number (USD), got %q", key, v)
+	}
+	return int64(math.Round(f * 100)), nil
 }
 
 // fallbackReset computes the per-key fallback reset instant: the next occurrence

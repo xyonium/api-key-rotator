@@ -291,10 +291,13 @@ func TestBuildProfiles_withApify(t *testing.T) {
 		LowCreditThreshold: 10,
 		StopCreditThreshold: 2,
 		Apify: ApifyConfig{
-			APIKeys:     []string{"apify-a", "apify-b"},
-			Upstream:    "https://api.apify.com",
-			RoutePrefix: "/v2/acts",
-			TimeoutSec:  180,
+			APIKeys:          []string{"apify-a", "apify-b"},
+			Upstream:         "https://api.apify.com",
+			RoutePrefix:      "/v2/acts",
+			TimeoutSec:       180,
+			FreeCreditUsd:    5,
+			LowCreditCents:   10,
+			StopCreditCents:  5,
 		},
 	}
 	profiles := buildProfiles(cfg)
@@ -314,8 +317,53 @@ func TestBuildProfiles_withApify(t *testing.T) {
 	if ap.UpstreamTimeout != 180*time.Second {
 		t.Fatalf("apify UpstreamTimeout = %v, want 180s", ap.UpstreamTimeout)
 	}
+	if ap.ApifyFreeCreditUsd != 5 {
+		t.Fatalf("apify ApifyFreeCreditUsd = %v, want 5", ap.ApifyFreeCreditUsd)
+	}
+	// Thresholds in cents flow into the pool: low 10, stop 5.
+	ap.pool.mu.Lock()
+	low, stop := ap.pool.lowThreshold, ap.pool.stopThreshold
+	ap.pool.mu.Unlock()
+	if low != 10 || stop != 5 {
+		t.Fatalf("apify pool thresholds = %d/%d cents, want 10/5", low, stop)
+	}
 	if ap.pool.Snapshot().PoolSize != 2 {
 		t.Fatalf("apify pool size = %d, want 2", ap.pool.Snapshot().PoolSize)
+	}
+}
+
+// TestApifyDisable_UsesBillingPeriodEnd: on 402 the apify profile disables the
+// key until the REAL usage-cycle end (from /v2/users/me/limits), not the
+// CREDIT_RESET_DAY fallback.
+func TestApifyDisable_UsesBillingPeriodEnd(t *testing.T) {
+	apifyFake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v2/users/me/limits" {
+			// Cycle ends Sep 1; CREDIT_RESET_DAY is 1, so fallback would also be
+			// day 1 - use day 15 to distinguish "real endAt" from "fallback".
+			_, _ = w.Write([]byte(`{"data":{"monthlyUsageCycle":{"startAt":"2026-08-15T00:00:00.000Z","endAt":"2026-09-15T23:59:59.999Z"},"limits":{"maxMonthlyUsageUsd":0},"current":{"monthlyUsageUsd":5.0}}}`))
+			return
+		}
+		w.WriteHeader(402) // actor endpoint: payment required
+	}))
+	defer apifyFake.Close()
+	fcFake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) }))
+	defer fcFake.Close()
+
+	cfg := cfgFor(fcFake)
+	cfg.CreditResetDay = 1
+	apPool := NewKeyPool([]string{"apify-a"})
+	apPool.SetCredits(0, 5)
+	r := apifyTestRotator(cfg, NewKeyPool(cfg.APIKeys), apPool, http.DefaultClient, fcFake.URL, apifyFake.URL)
+	r.profiles[1].ApifyFreeCreditUsd = 5
+
+	post(t, r, "/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
+	k := apPool.Snapshot().Keys[0]
+	if !k.Disabled {
+		t.Fatal("key should be disabled after 402")
+	}
+	if k.DisabledUntil.Day() != 15 {
+		t.Fatalf("DisabledUntil = %v, want day 15 (real monthlyUsageCycle.endAt), not CREDIT_RESET_DAY fallback", k.DisabledUntil)
 	}
 }
 

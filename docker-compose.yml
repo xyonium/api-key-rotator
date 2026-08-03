@@ -21,6 +21,9 @@ services:
       # APIFY_UPSTREAM: "https://api.apify.com"     # point at your own fake/stub for testing
       # APIFY_ROUTE_PREFIX: "/v2/acts"              # kept in forwarded path
       # APIFY_TIMEOUT_SEC: "180"                    # sync actor runs take 30-120s
+      # APIFY_FREE_CREDIT_USD: "5"                  # plan's included monthly credit (free=5)
+      # APIFY_LOW_CREDIT_USD: "0.10"                # rotate off a token below this balance
+      # APIFY_STOP_CREDIT_USD: "0.05"               # 503 when every token is below this
     ports:
       - "8788:8788"
     healthcheck:

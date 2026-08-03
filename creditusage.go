@@ -3,18 +3,22 @@ package main
 import (
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// usage holds a key's live credit balance and billing reset instant, both read
-// from one GET /v2/team/credit-usage call. ok is false when the call failed or
-// the response was unparseable.
+// usage holds a key's live credit balance and billing reset instant. remaining
+// is in the profile's credit unit (credits for firecrawl/tavily, CENTS for
+// apify). periodEnd is meaningful only when hasEnd is true. ok is false when
+// the call failed or the response was unparseable.
 type usage struct {
 	remaining int64
 	periodEnd time.Time
+	hasEnd    bool
 	ok        bool
 }
 
@@ -124,23 +128,102 @@ func fetchUsageOnce(c *http.Client, upstream, key string) (usage, string) {
 	if env.Data.BillingPeriodEnd != "" {
 		if t, err := time.Parse(time.RFC3339, env.Data.BillingPeriodEnd); err == nil {
 			u.periodEnd = t
+			u.hasEnd = true
 		}
 	}
 	return u, ""
 }
 
-// fetchUsageFor dispatches to the profile's provider usage endpoint. Profiles
-// without a usage endpoint (apify) report not-ok, leaving their keys
-// "unmeasured" (remainingCredits -1) forever - selection then falls back to
-// first-usable-key with cooldown rotation.
+// fetchUsageFor dispatches to the profile's provider usage endpoint.
 func fetchUsageFor(p *Profile, client *http.Client, key string, log *logger) usage {
 	if p.Name == "tavily" {
 		return fetchTavilyUsage(client, p.Upstream, key, log)
 	}
 	if p.Name == "apify" {
-		return usage{}
+		return fetchApifyUsage(client, p, key, log)
 	}
 	return fetchUsage(client, p.Upstream, key, log)
+}
+
+// fetchApifyUsage reads a token's balance from GET {upstream}/v2/users/me/limits
+// (read-only). Apify bills in USD against a monthly free/plan credit, so
+// remaining is computed as (FreeCreditUsd - current.monthlyUsageUsd) in CENTS,
+// and periodEnd is the real monthlyUsageCycle.endAt (the billing anniversary,
+// NOT the 1st of the month). Retries transient failures like the other
+// providers.
+func fetchApifyUsage(client *http.Client, p *Profile, key string, log *logger) usage {
+	const timeout = 5 * time.Second
+	c := client
+	if c == nil {
+		c = &http.Client{Timeout: timeout}
+	} else {
+		c = &http.Client{Transport: c.Transport, Timeout: timeout}
+	}
+
+	var lastReason string
+	for attempt := 0; attempt <= len(usageBackoff); attempt++ {
+		u, reason := fetchApifyUsageOnce(c, p, key)
+		if u.ok {
+			return u
+		}
+		lastReason = reason
+		if !shouldRetryUsage(reason) || attempt >= len(usageBackoff) {
+			break
+		}
+		time.Sleep(usageBackoff[attempt])
+	}
+	if log != nil {
+		log.warn("apify limits fetch failed", "reason", lastReason, "masked", maskKey(key))
+	}
+	return usage{}
+}
+
+func fetchApifyUsageOnce(c *http.Client, p *Profile, key string) (usage, string) {
+	req, err := http.NewRequest(http.MethodGet, p.Upstream+"/v2/users/me/limits?token="+url.QueryEscape(key), nil)
+	if err != nil {
+		return usage{}, "build:" + err.Error()
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.Do(req)
+	if err != nil {
+		return usage{}, "net:" + err.Error()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return usage{}, "status:" + strconv.Itoa(resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	if err != nil {
+		return usage{}, "read:" + err.Error()
+	}
+	var env struct {
+		Data struct {
+			MonthlyUsageCycle struct {
+				StartAt string `json:"startAt"`
+				EndAt   string `json:"endAt"`
+			} `json:"monthlyUsageCycle"`
+			Current struct {
+				MonthlyUsageUsd float64 `json:"monthlyUsageUsd"`
+			} `json:"current"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return usage{}, "parse:" + err.Error()
+	}
+	// remaining in cents; clamp at 0 when over the included credit.
+	remUsd := p.ApifyFreeCreditUsd - env.Data.Current.MonthlyUsageUsd
+	remCents := int64(math.Round(remUsd * 100))
+	if remCents < 0 {
+		remCents = 0
+	}
+	u := usage{remaining: remCents, ok: true}
+	if env.Data.MonthlyUsageCycle.EndAt != "" {
+		if t, err := time.Parse(time.RFC3339, env.Data.MonthlyUsageCycle.EndAt); err == nil {
+			u.periodEnd = t
+			u.hasEnd = true
+		}
+	}
+	return u, ""
 }
 
 // fetchTavilyUsage reads a key's usage from GET {upstream}/usage (read-only,
@@ -260,14 +343,16 @@ func refreshKey(p *Profile, client *http.Client, index int, key string, log *log
 }
 
 // disableUntilReset disables key index in the profile's pool. Firecrawl keys
-// reset at their real billing-period end when available; Tavily and Apify
-// expose no period end, so they always use the CREDIT_RESET_DAY fallback.
+// reset at their real billing-period end when available, and Apify keys at
+// their real monthlyUsageCycle.endAt; Tavily exposes no period end, so it
+// always uses the CREDIT_RESET_DAY fallback (as does any profile whose usage
+// fetch fails to return a period end).
 func disableUntilReset(p *Profile, client *http.Client, index int, key string, now time.Time, log *logger) {
 	fallback := fallbackReset(now, p.CreditResetDay)
 	reset := fallback
-	if p.Name != "tavily" && p.Name != "apify" {
+	if p.Name != "tavily" {
 		u := fetchUsageFor(p, client, key, log)
-		if u.ok && !u.periodEnd.IsZero() && !u.periodEnd.Before(now) && !u.periodEnd.After(now.AddDate(1, 0, 0)) {
+		if u.ok && u.hasEnd && !u.periodEnd.Before(now) && !u.periodEnd.After(now.AddDate(1, 0, 0)) {
 			reset = u.periodEnd
 		}
 	}
