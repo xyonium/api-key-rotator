@@ -129,10 +129,16 @@ func fetchUsageOnce(c *http.Client, upstream, key string) (usage, string) {
 	return u, ""
 }
 
-// fetchUsageFor dispatches to the profile's provider usage endpoint.
+// fetchUsageFor dispatches to the profile's provider usage endpoint. Profiles
+// without a usage endpoint (apify) report not-ok, leaving their keys
+// "unmeasured" (remainingCredits -1) forever - selection then falls back to
+// first-usable-key with cooldown rotation.
 func fetchUsageFor(p *Profile, client *http.Client, key string, log *logger) usage {
 	if p.Name == "tavily" {
 		return fetchTavilyUsage(client, p.Upstream, key, log)
+	}
+	if p.Name == "apify" {
+		return usage{}
 	}
 	return fetchUsage(client, p.Upstream, key, log)
 }
@@ -254,12 +260,12 @@ func refreshKey(p *Profile, client *http.Client, index int, key string, log *log
 }
 
 // disableUntilReset disables key index in the profile's pool. Firecrawl keys
-// reset at their real billing-period end when available; Tavily exposes no
-// period end, so it always uses the CREDIT_RESET_DAY fallback.
+// reset at their real billing-period end when available; Tavily and Apify
+// expose no period end, so they always use the CREDIT_RESET_DAY fallback.
 func disableUntilReset(p *Profile, client *http.Client, index int, key string, now time.Time, log *logger) {
 	fallback := fallbackReset(now, p.CreditResetDay)
 	reset := fallback
-	if p.Name != "tavily" {
+	if p.Name != "tavily" && p.Name != "apify" {
 		u := fetchUsageFor(p, client, key, log)
 		if u.ok && !u.periodEnd.IsZero() && !u.periodEnd.Before(now) && !u.periodEnd.After(now.AddDate(1, 0, 0)) {
 			reset = u.periodEnd

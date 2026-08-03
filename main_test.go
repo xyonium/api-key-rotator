@@ -10,6 +10,7 @@ import (
 func TestMain_SmokeHealthz(t *testing.T) {
 	// Start the full server on a random port and hit /healthz.
 	t.Setenv("FIRECRAWL_API_KEYS", "fc-smoke")
+	t.Setenv("APIFY_API_KEYS", "apify-smoke")
 	// Clear potentially-set env vars that LoadConfig validates, so the test
 	// is robust to the host environment.
 	t.Setenv("UPSTREAM", "")

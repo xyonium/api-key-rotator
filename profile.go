@@ -1,8 +1,10 @@
 package main
 
 import (
+	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Profile is one upstream provider's runtime bundle: key pool, refresher, and
@@ -15,9 +17,19 @@ type Profile struct {
 	UpstreamHost   string
 	CreditResetDay int
 	RewriteNext    bool // rewrite "next" pagination URLs (firecrawl only)
+	// KeepPrefix forwards the matched RoutePrefix as part of the upstream path
+	// instead of stripping it (apify: the real API lives under /v2/acts).
+	KeepPrefix bool
+	// AuthQueryParam authenticates by setting this query parameter to the key
+	// instead of an Authorization header (apify: "token").
+	AuthQueryParam string
+	// UpstreamTimeout, when > 0, gives this profile its own HTTP client with
+	// this timeout (apify sync actor runs take 30-120s, beyond the shared 30s).
+	UpstreamTimeout time.Duration
 
 	pool    *KeyPool
 	refresh *Refresher
+	client  *http.Client // per-profile override; nil = use the shared client
 }
 
 // buildProfiles constructs the runtime profiles from config. The firecrawl
@@ -53,6 +65,29 @@ func buildProfiles(cfg Config) []*Profile {
 			pool:           tvPool,
 		})
 	}
+
+	if len(cfg.Apify.APIKeys) > 0 {
+		apPool := NewKeyPool(cfg.Apify.APIKeys)
+		// Thresholds stay at the KeyPool defaults: with no usage endpoint every
+		// key is unmeasured (MaxInt64), so credit-based selection never engages;
+		// rotation is driven purely by rejections (402 disables, 401/429 cool).
+		host := cfg.Apify.Upstream
+		if i := strings.Index(host, "://"); i >= 0 {
+			host = host[i+3:]
+		}
+		profiles = append(profiles, &Profile{
+			Name:            "apify",
+			RoutePrefix:     cfg.Apify.RoutePrefix,
+			Upstream:        cfg.Apify.Upstream,
+			UpstreamHost:    host,
+			CreditResetDay:  cfg.CreditResetDay,
+			RewriteNext:     false,
+			KeepPrefix:      true,
+			AuthQueryParam:  "token",
+			UpstreamTimeout: time.Duration(cfg.Apify.TimeoutSec) * time.Second,
+			pool:            apPool,
+		})
+	}
 	return profiles
 }
 //
@@ -63,12 +98,22 @@ func buildProfiles(cfg Config) []*Profile {
 // tavily: 401/429/432/433 rotate purely on status; the body is never
 // consulted (Tavily error codes are unambiguous).
 //
+// apify: 401/402/429 rotate purely on status; the body is never consulted
+// (success is a bare dataset-items ARRAY, which has no envelope to scan).
+//
 // 403 is never here for any profile - it is transient (edge/WAF) and retried
 // with backoff on the SAME key via shouldRetry.
 func (p *Profile) shouldRotate(status int, body []byte) (bool, string) {
 	if p.Name == "tavily" {
 		switch status {
 		case 401, 429, 432, 433:
+			return true, "status " + strconv.Itoa(status)
+		}
+		return false, ""
+	}
+	if p.Name == "apify" {
+		switch status {
+		case 401, 402, 429:
 			return true, "status " + strconv.Itoa(status)
 		}
 		return false, ""
@@ -93,9 +138,13 @@ func (p *Profile) shouldRotate(status int, body []byte) (bool, string) {
 //
 // firecrawl: 402, or a failure envelope mentioning credits/payment.
 // tavily: 432 (plan limit) / 433 (pay-as-you-go limit), status only.
+// apify: 402 only, status only (its 402 means the account is out of credits).
 func (p *Profile) isCreditExhausted(status int, body []byte) bool {
 	if p.Name == "tavily" {
 		return status == 432 || status == 433
+	}
+	if p.Name == "apify" {
+		return status == 402
 	}
 	if status == 402 {
 		return true
@@ -112,8 +161,8 @@ func (p *Profile) isCreditExhausted(status int, body []byte) bool {
 // matchProfile resolves a request path to a profile. A prefixed profile
 // matches when path == prefix or path starts with prefix+"/" (segment
 // boundary, so "/tavilyfoo" does not match "/tavily"). The matched prefix is
-// stripped. The no-prefix profile is the fallback for everything else,
-// including prefixes that were never configured.
+// stripped unless the profile sets KeepPrefix. The no-prefix profile is the
+// fallback for everything else, including prefixes that were never configured.
 func matchProfile(profiles []*Profile, path string) (*Profile, string, bool) {
 	var def *Profile
 	for _, p := range profiles {
@@ -122,9 +171,15 @@ func matchProfile(profiles []*Profile, path string) (*Profile, string, bool) {
 			continue
 		}
 		if path == p.RoutePrefix {
+			if p.KeepPrefix {
+				return p, path, true
+			}
 			return p, "/", true
 		}
 		if strings.HasPrefix(path, p.RoutePrefix+"/") {
+			if p.KeepPrefix {
+				return p, path, true
+			}
 			return p, path[len(p.RoutePrefix):], true
 		}
 	}
