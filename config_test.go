@@ -9,7 +9,7 @@ import (
 
 func TestLoadConfig_defaults(t *testing.T) {
 	t.Setenv("FIRECRAWL_API_KEYS", "fc-a, fc-b ,, fc-c")
-	for _, k := range []string{"UPSTREAM", "PORT", "HOST", "MAX_PASSES", "MAX_BODY_BYTES", "PROXY_BASE_URL", "UPSTREAM_PROXY", "LOG_LEVEL", "CREDIT_RESET_DAY", "LOW_CREDIT_THRESHOLD", "STOP_CREDIT_THRESHOLD", "CREDIT_REFRESH_INTERVAL", "TAVILY_API_KEYS", "TAVILY_UPSTREAM", "TAVILY_ROUTE_PREFIX", "TAVILY_LOW_CREDIT_THRESHOLD", "TAVILY_STOP_CREDIT_THRESHOLD"} {
+	for _, k := range []string{"UPSTREAM", "PORT", "HOST", "MAX_PASSES", "MAX_BODY_BYTES", "PROXY_BASE_URL", "UPSTREAM_PROXY", "LOG_LEVEL", "CREDIT_RESET_DAY", "LOW_CREDIT_THRESHOLD", "STOP_CREDIT_THRESHOLD", "CREDIT_REFRESH_INTERVAL", "TAVILY_API_KEYS", "TAVILY_UPSTREAM", "TAVILY_ROUTE_PREFIX", "TAVILY_LOW_CREDIT_THRESHOLD", "TAVILY_STOP_CREDIT_THRESHOLD", "APIFY_API_KEYS", "APIFY_UPSTREAM", "APIFY_ROUTE_PREFIX", "APIFY_TIMEOUT_SEC"} {
 		t.Setenv(k, "")
 	}
 	cfg, err := LoadConfig()
@@ -35,6 +35,12 @@ func TestLoadConfig_defaults(t *testing.T) {
 			RoutePrefix: "/tavily",
 			LowCredit:   10,
 			StopCredit:  2,
+		},
+		Apify: ApifyConfig{
+			APIKeys:     nil,
+			Upstream:    "https://api.apify.com",
+			RoutePrefix: "/v2/acts",
+			TimeoutSec:  180,
 		},
 	}
 	if !reflect.DeepEqual(cfg, want) {
@@ -219,5 +225,73 @@ func TestLoadConfig_tavilyStopAboveLowErrors(t *testing.T) {
 	t.Setenv("TAVILY_STOP_CREDIT_THRESHOLD", "5")
 	if _, err := LoadConfig(); err == nil {
 		t.Fatal("expected error when TAVILY_STOP > TAVILY_LOW, got nil")
+	}
+}
+
+func TestLoadConfig_apifyDefaultsWhenUnset(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Apify.APIKeys) != 0 {
+		t.Fatalf("Apify.APIKeys = %v, want empty (profile disabled)", cfg.Apify.APIKeys)
+	}
+	// Defaults are still populated so the profile is ready if keys appear.
+	if cfg.Apify.Upstream != "https://api.apify.com" {
+		t.Fatalf("Apify.Upstream = %q", cfg.Apify.Upstream)
+	}
+	if cfg.Apify.RoutePrefix != "/v2/acts" {
+		t.Fatalf("Apify.RoutePrefix = %q", cfg.Apify.RoutePrefix)
+	}
+	if cfg.Apify.TimeoutSec != 180 {
+		t.Fatalf("Apify.TimeoutSec = %d, want 180 (sync actor runs take 30-120s)", cfg.Apify.TimeoutSec)
+	}
+}
+
+func TestLoadConfig_apifyKeysParsed(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	t.Setenv("APIFY_API_KEYS", "apify-a, apify-b")
+	t.Setenv("APIFY_TIMEOUT_SEC", "300")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Apify.APIKeys) != 2 || cfg.Apify.APIKeys[0] != "apify-a" || cfg.Apify.APIKeys[1] != "apify-b" {
+		t.Fatalf("Apify.APIKeys = %v", cfg.Apify.APIKeys)
+	}
+	if cfg.Apify.TimeoutSec != 300 {
+		t.Fatalf("Apify.TimeoutSec = %d, want 300", cfg.Apify.TimeoutSec)
+	}
+}
+
+func TestLoadConfig_apifyBadTimeoutErrors(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	t.Setenv("APIFY_API_KEYS", "apify-a")
+	for _, bad := range []string{"0", "-5", "abc"} {
+		t.Setenv("APIFY_TIMEOUT_SEC", bad)
+		if _, err := LoadConfig(); err == nil {
+			t.Fatalf("expected error for APIFY_TIMEOUT_SEC=%q, got nil", bad)
+		}
+	}
+}
+
+func TestLoadConfig_apifyBadPrefixErrors(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	t.Setenv("APIFY_API_KEYS", "apify-a")
+	for _, bad := range []string{"v2/acts", "/", "/v2/acts/", "/healthz", "/status"} {
+		t.Setenv("APIFY_ROUTE_PREFIX", bad)
+		if _, err := LoadConfig(); err == nil {
+			t.Fatalf("expected error for APIFY_ROUTE_PREFIX=%q, got nil", bad)
+		}
+	}
+}
+
+func TestLoadConfig_apifyBadUpstreamErrors(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	t.Setenv("APIFY_API_KEYS", "apify-a")
+	t.Setenv("APIFY_UPSTREAM", "ftp://example.com")
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("expected error for APIFY_UPSTREAM=ftp://example.com, got nil")
 	}
 }

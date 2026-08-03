@@ -4,12 +4,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func profilesForTest() []*Profile {
 	fc := &Profile{Name: "firecrawl", RoutePrefix: "", pool: NewKeyPool([]string{"fc-a"})}
 	tv := &Profile{Name: "tavily", RoutePrefix: "/tavily", pool: NewKeyPool([]string{"tvly-a"})}
-	return []*Profile{fc, tv}
+	ap := &Profile{Name: "apify", RoutePrefix: "/v2/acts", KeepPrefix: true, AuthQueryParam: "token", pool: NewKeyPool([]string{"apify-a"})}
+	return []*Profile{fc, tv, ap}
 }
 
 func TestMatchProfile(t *testing.T) {
@@ -25,6 +27,9 @@ func TestMatchProfile(t *testing.T) {
 		{"/tavily/extract", "tavily", "/extract", true},
 		{"/tavily", "tavily", "/", true},
 		{"/tavilyfoo/search", "firecrawl", "/tavilyfoo/search", true}, // no segment boundary -> default
+		{"/v2/acts/u~a/run-sync-get-dataset-items", "apify", "/v2/acts/u~a/run-sync-get-dataset-items", true}, // kept whole
+		{"/v2/acts", "apify", "/v2/acts", true}, // exact match also kept whole
+		{"/v2/actsfoo/x", "firecrawl", "/v2/actsfoo/x", true}, // no segment boundary -> default
 		{"/", "firecrawl", "/", true},
 	}
 	for _, c := range cases {
@@ -87,6 +92,28 @@ func TestProfile_shouldRotate_tavily(t *testing.T) {
 	}
 }
 
+func TestProfile_shouldRotate_apify(t *testing.T) {
+	p := &Profile{Name: "apify"}
+	for _, st := range []int{401, 402, 429} {
+		if rotate, _ := p.shouldRotate(st, nil); !rotate {
+			t.Errorf("apify shouldRotate(%d) = false, want true", st)
+		}
+	}
+	// 403 is NOT here: it stays transient (retried on the same key) like the
+	// other profiles - only backoff-exhausted 403s rotate via the netErr path.
+	for _, st := range []int{200, 400, 403, 404} {
+		if rotate, _ := p.shouldRotate(st, nil); rotate {
+			t.Errorf("apify shouldRotate(%d) = true, want false", st)
+		}
+	}
+	// Body text never triggers rotation: a 200 dataset-items array containing
+	// denylist words is content, not a rejection.
+	body := []byte(`[{"text":"rate limit exceeded"}]`)
+	if rotate, _ := p.shouldRotate(200, body); rotate {
+		t.Error("apify shouldRotate(200, denylist-ish array body) = true, want false")
+	}
+}
+
 func TestProfile_isCreditExhausted(t *testing.T) {
 	fc := &Profile{Name: "firecrawl"}
 	if !fc.isCreditExhausted(402, nil) {
@@ -118,6 +145,20 @@ func TestProfile_isCreditExhausted(t *testing.T) {
 	// Tavily never disables on body text.
 	if tv.isCreditExhausted(200, []byte(`{"detail":{"error":"insufficient credits"}}`)) {
 		t.Error("tavily isCreditExhausted(200 body) = true, want false")
+	}
+
+	ap := &Profile{Name: "apify"}
+	if !ap.isCreditExhausted(402, nil) {
+		t.Error("apify isCreditExhausted(402) = false, want true")
+	}
+	for _, st := range []int{401, 429} {
+		if ap.isCreditExhausted(st, nil) {
+			t.Errorf("apify isCreditExhausted(%d) = true, want false", st)
+		}
+	}
+	// Apify never disables on body text, whatever it says.
+	if ap.isCreditExhausted(200, []byte(`{"error":{"type":"insufficient-credits"}}`)) {
+		t.Error("apify isCreditExhausted(200 body) = true, want false")
 	}
 }
 
@@ -239,6 +280,42 @@ func TestBuildProfiles_withTavily(t *testing.T) {
 	}
 	if tv.pool.Snapshot().PoolSize != 2 {
 		t.Fatalf("tavily pool size = %d, want 2", tv.pool.Snapshot().PoolSize)
+	}
+}
+
+func TestBuildProfiles_withApify(t *testing.T) {
+	cfg := Config{
+		APIKeys:            []string{"fc-a"},
+		Upstream:           "https://api.firecrawl.dev",
+		UpstreamHost:       "api.firecrawl.dev",
+		LowCreditThreshold: 10,
+		StopCreditThreshold: 2,
+		Apify: ApifyConfig{
+			APIKeys:     []string{"apify-a", "apify-b"},
+			Upstream:    "https://api.apify.com",
+			RoutePrefix: "/v2/acts",
+			TimeoutSec:  180,
+		},
+	}
+	profiles := buildProfiles(cfg)
+	if len(profiles) != 2 {
+		t.Fatalf("len = %d, want 2", len(profiles))
+	}
+	ap := profiles[1]
+	if ap.Name != "apify" || ap.RoutePrefix != "/v2/acts" || ap.RewriteNext {
+		t.Fatalf("apify profile = %+v", ap)
+	}
+	if ap.UpstreamHost != "api.apify.com" {
+		t.Fatalf("apify UpstreamHost = %q", ap.UpstreamHost)
+	}
+	if ap.AuthQueryParam != "token" {
+		t.Fatalf("apify AuthQueryParam = %q, want token", ap.AuthQueryParam)
+	}
+	if ap.UpstreamTimeout != 180*time.Second {
+		t.Fatalf("apify UpstreamTimeout = %v, want 180s", ap.UpstreamTimeout)
+	}
+	if ap.pool.Snapshot().PoolSize != 2 {
+		t.Fatalf("apify pool size = %d, want 2", ap.pool.Snapshot().PoolSize)
 	}
 }
 

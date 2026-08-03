@@ -160,6 +160,10 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // status/header/body, whether the body was over the cap, and netErr=true if the
 // key gave up after exhausting backoff retries (caller rotates).
 func (r *rotator) tryKey(req *http.Request, p *Profile, idx int, key string, inBody []byte, strippedPath string) (status int, header http.Header, body []byte, capped bool, netErr bool) {
+	client := r.client
+	if p.client != nil {
+		client = p.client
+	}
 	for attempt := 0; attempt < len(backoffSchedule)+1; attempt++ {
 		upstreamURL := p.Upstream + strippedPath
 		if req.URL.RawQuery != "" {
@@ -172,7 +176,15 @@ func (r *rotator) tryKey(req *http.Request, p *Profile, idx int, key string, inB
 		copyHeaders(upReq.Header, req.Header)
 		upReq.Header.Del("Authorization")
 		upReq.Header.Del("Host")
-		upReq.Header.Set("Authorization", "Bearer "+key)
+		if p.AuthQueryParam != "" {
+			// Query-param auth (apify): the key rides in the URL, not a header.
+			// Set replaces any client-supplied value, so rotation just works.
+			q := upReq.URL.Query()
+			q.Set(p.AuthQueryParam, key)
+			upReq.URL.RawQuery = q.Encode()
+		} else {
+			upReq.Header.Set("Authorization", "Bearer "+key)
+		}
 		upReq.Host = p.UpstreamHost
 		for k := range upReq.Header {
 			if isHopByHop(k) {
@@ -180,7 +192,7 @@ func (r *rotator) tryKey(req *http.Request, p *Profile, idx int, key string, inB
 			}
 		}
 
-		resp, err := r.client.Do(upReq)
+		resp, err := client.Do(upReq)
 		if err != nil {
 			// network error: retry same key with backoff if attempts remain
 			if attempt < len(backoffSchedule) && r.sleepOrCancel(req, backoffSchedule[attempt]) {

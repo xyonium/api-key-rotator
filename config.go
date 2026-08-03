@@ -25,6 +25,7 @@ type Config struct {
 	StopCreditThreshold int64 // stop accepting requests when every key is below this (default 2)
 	CreditRefreshSec    int   // seconds between background remainingCredits refreshes (default 300)
 	Tavily              TavilyConfig
+	Apify               ApifyConfig
 }
 
 // TavilyConfig holds the Tavily profile's settings. The profile is disabled
@@ -35,6 +36,17 @@ type TavilyConfig struct {
 	RoutePrefix string
 	LowCredit   int64
 	StopCredit  int64
+}
+
+// ApifyConfig holds the Apify profile's settings. The profile is disabled
+// when APIKeys is empty. There are no credit thresholds: Apify exposes no
+// cheap usage endpoint, so its keys stay "unmeasured" and rotation is purely
+// rejection-driven (402 disables, 401/429 cool down).
+type ApifyConfig struct {
+	APIKeys     []string
+	Upstream    string
+	RoutePrefix string
+	TimeoutSec  int // upstream client timeout; sync actor runs take 30-120s
 }
 
 func envStr(key, def string) string {
@@ -164,9 +176,15 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 
+	apify, err := loadApifyConfig()
+	if err != nil {
+		return Config{}, err
+	}
+
 	return Config{
 		APIKeys:       keys,
 		Tavily:        tavily,
+		Apify:         apify,
 		Upstream:      strings.TrimRight(upstream, "/"),
 		UpstreamHost:  u.Host,
 		Port:          envStr("PORT", "8788"),
@@ -226,6 +244,43 @@ func loadTavilyConfig(sharedLow, sharedStop int64) (TavilyConfig, error) {
 		return TavilyConfig{}, fmt.Errorf("TAVILY_STOP_CREDIT_THRESHOLD (%d) must be <= TAVILY_LOW_CREDIT_THRESHOLD (%d)", t.StopCredit, t.LowCredit)
 	}
 	return t, nil
+}
+
+// loadApifyConfig parses the APIFY_* env vars. The route prefix must start
+// with '/', must not end with '/', and must not shadow the reserved /healthz
+// or /status paths. The default prefix /v2/acts shadows only Apify actor
+// endpoints on the firecrawl default profile; other /v2/* paths (firecrawl's
+// own API) are unaffected. APIFY_TIMEOUT_SEC must cover synchronous actor
+// runs (30-120s), so it defaults to 180 and must be positive.
+func loadApifyConfig() (ApifyConfig, error) {
+	a := ApifyConfig{
+		APIKeys:     parseKeys(os.Getenv("APIFY_API_KEYS")),
+		RoutePrefix: envStr("APIFY_ROUTE_PREFIX", "/v2/acts"),
+		TimeoutSec:  180,
+	}
+
+	upstream := envStr("APIFY_UPSTREAM", "https://api.apify.com")
+	au, err := url.Parse(upstream)
+	if err != nil || au.Host == "" || (au.Scheme != "http" && au.Scheme != "https") {
+		return ApifyConfig{}, fmt.Errorf("APIFY_UPSTREAM %q is not a valid http(s) URL", upstream)
+	}
+	a.Upstream = strings.TrimRight(upstream, "/")
+
+	if !strings.HasPrefix(a.RoutePrefix, "/") || len(a.RoutePrefix) < 2 || strings.HasSuffix(a.RoutePrefix, "/") {
+		return ApifyConfig{}, fmt.Errorf("APIFY_ROUTE_PREFIX %q must start with '/' and be a non-root path without trailing slash", a.RoutePrefix)
+	}
+	if a.RoutePrefix == "/healthz" || a.RoutePrefix == "/status" {
+		return ApifyConfig{}, fmt.Errorf("APIFY_ROUTE_PREFIX %q shadows a reserved path", a.RoutePrefix)
+	}
+
+	if v := strings.TrimSpace(os.Getenv("APIFY_TIMEOUT_SEC")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return ApifyConfig{}, fmt.Errorf("APIFY_TIMEOUT_SEC must be a positive integer (seconds), got %q", v)
+		}
+		a.TimeoutSec = n
+	}
+	return a, nil
 }
 
 // fallbackReset computes the per-key fallback reset instant: the next occurrence

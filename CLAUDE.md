@@ -5,15 +5,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `api-key-rotator` is a Go reverse proxy that provides key rotation for
-multiple API providers, currently **Firecrawl** and **Tavily**. Each provider
-is a "profile" with its own key pool, upstream base URL, route prefix, and
-rotation policy.
+multiple API providers, currently **Firecrawl**, **Tavily**, and **Apify**.
+Each provider is a "profile" with its own key pool, upstream base URL, route
+prefix, and rotation policy.
 
-- **Firecrawl**: requests without a Tavily prefix go to `api.firecrawl.dev`,
-  with keys selected by remaining credits. Crawl `next` pagination URLs are
-  rewritten so pagination stays under rotation.
+- **Firecrawl**: requests without a Tavily/Apify prefix go to
+  `api.firecrawl.dev`, with keys selected by remaining credits. Crawl `next`
+  pagination URLs are rewritten so pagination stays under rotation.
 - **Tavily**: requests with `/tavily` prefix are routed to `api.tavily.com`
   (prefix stripped). Rotation is purely status-code-driven (no body denylist).
+- **Apify**: requests with `/v2/acts` prefix are routed to `api.apify.com`
+  with the prefix **kept** (the real API lives under `/v2/acts`). Auth is the
+  `?token=` **query param** (rotator replaces/adds it per attempt, drops any
+  client `Authorization` header). Own HTTP client with `APIFY_TIMEOUT_SEC`
+  (default 180s) because sync actor runs take 30-120s. No usage endpoint, so
+  tokens stay unmeasured; 402 disables (CREDIT_RESET_DAY fallback), 401/429
+  cool down. Success is a bare dataset-items array - body is never scanned.
 
 The whole point: point firecrawl-mcp's `FIRECRAWL_API_URL` at this proxy and
 get key rotation with **zero changes** to firecrawl-mcp. Tavily works by
@@ -72,10 +79,10 @@ Key files and their roles:
 
 | File | Responsibility |
 |------|----------------|
-| `main.go` | `buildServer` wires `Config` -> `[]Profile` -> transports -> clients -> `Refresher` per profile -> `rotator`. Routes `/healthz`, `/status`, `/`. `--healthcheck` flag. Starts goroutines: `RefreshAll` warm-up, `resetLoop`, `dailyRefreshLoop`. |
-| `config.go` | `LoadConfig` parses all env vars; `buildProfiles` constructs Firecrawl + (optional) Tavily profiles. Validates thresholds (stop <= low). |
+| `main.go` | `buildServer` wires `Config` -> `[]Profile` -> transports -> clients (per-profile client when `UpstreamTimeout` > 0, e.g. apify's 180s) -> `Refresher` per profile -> `rotator`. Routes `/healthz`, `/status`, `/`. `--healthcheck` flag. Starts goroutines: `RefreshAll` warm-up, `resetLoop`, `dailyRefreshLoop`. |
+| `config.go` | `LoadConfig` parses all env vars; `buildProfiles` constructs Firecrawl + (optional) Tavily/Apify profiles. Validates thresholds (stop <= low). |
 | `keys.go` | `KeyPool` - per-key `stats`, `disabled`/`disabledUntil`, `remainingCredits` (MaxInt64 = unmeasured), `cooldownUntil`. `Current`/`currentLocked` pick highest-credit usable key, skipping cooled-down keys (fallback to them if all cooled). `Advance` cools the current key ~30s so equal-credit keys actually rotate. `Decrement`/`SetCredits` adjust predicted/real balances. `AnyUsable` checks >= stop threshold. `Snapshot` masks keys + reports `remainingCredits` (-1 = unmeasured). |
-| `profile.go` | `Profile` struct (pool, upstream, route prefix, rotation policy funcs). `matchProfile` routes requests. `getRotateFunc`/`getRetryFunc`/`getCreditExhaustedFunc` per profile. |
+| `profile.go` | `Profile` struct (pool, upstream, route prefix, `KeepPrefix`, `AuthQueryParam`, `UpstreamTimeout`, rotation policy funcs). `matchProfile` routes requests (strips prefix unless `KeepPrefix`). |
 | `proxy.go` | The rotator: profile routing, rotation loop + `tryKey` (backoff retries on transient), header copying, body cap, disable-on-credit-exhaustion, credit decrement on success, rewrite+guard, 503 when no usable key. `backoffSchedule`, `extractCreditsUsed`, `readCapped`, `writeRawResponse`, `isHopByHop`. |
 | `rotate.go` | `shouldRotate` / `shouldRetry` / `isCreditExhausted` — now profile-aware wrappers that dispatch to Firecrawl-specific or Tavily-specific logic. |
 | `refresh.go` | `Refresher` per profile: `OnSwitch`, `MaybeRefreshLow`, `DailyRefresh`, `RefreshAll`. All refreshes run in background goroutines. |
@@ -90,7 +97,8 @@ Key files and their roles:
 - **403 is transient, not a key rejection.** A 403 is usually an edge/WAF/network-layer issue, so `tryKey` retries it with backoff on the **same key** (`shouldRetry`), and only rotates after backoff is exhausted. It is NOT in `shouldRotate` and never disables. Moving 403 back to rotate/disable would reintroduce the production storm where every key 403s and all get disabled.
 - **A `success:true` response NEVER rotates.** The denylist is checked only against failure envelopes (`success:false` or 4xx), never the whole body. Scraped content routinely contains "rate limit"/"payment required"/"credits"; scanning the whole body (the original bug) misclassified good responses and burned credits.
 - **Credit-exhausted keys are disabled, not retried.** A genuine 402 / `success:false`+credits envelope disables the key until its reset instant (queried per-key via `/v2/team/credit-usage`); 429/401 rotate-but-keep. Disabling on rate-limit/auth would take a good key offline.
-- **Tavily rotates purely on status codes, never body text.** The Firecrawl denylist (body scanning on failure envelopes) is firecrawl-only. Tavily rejects are detected by status code (401/429 rotate, 432/433 disable), matching Tavily's documented behavior.
+- **Tavily rotates purely on status codes, never body text.** The Firecrawl denylist (body scanning on failure envelopes) is firecrawl-only. Tavily rejects are detected by status code (401/429 rotate, 432/433 disable), matching Tavily's documented behavior. Apify likewise: 401/429 rotate, 402 disables, status only - a success is a bare dataset-items array with no envelope to scan.
+- **Apify authenticates via `?token=` query param, not a header.** `tryKey` replaces/adds the param per attempt (`AuthQueryParam`) and drops any client `Authorization` header; the rest of the query string is preserved. Its route prefix is **kept** (`KeepPrefix`), and it gets its own `http.Client` with `APIFY_TIMEOUT_SEC` (default 180s) since sync actor runs take 30-120s.
 - **Predicted credits decrement between refreshes.** `Decrement` subtracts `creditsUsed` (or 1) on success so selection stays roughly correct without a refresh per request. Unmeasured keys (MaxInt64) are never decremented. `Refresher` corrects drift: on switch, when predicted < 100 (throttled), and daily.
 - **`Current()`/`Advance()` lock independently.** Concurrent requests can pick the same key; a per-request lock would serialize all upstream calls. This is deliberate. A good key is found within `MaxPasses` sweeps.
 - **`next`-URL rewriting is intentionally narrow.** Only `"next"` keys with absolute URLs on the upstream host are rewritten. Never broaden this - scraped content can legitimately contain the upstream host.

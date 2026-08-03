@@ -26,6 +26,11 @@ func buildServer() (*http.Server, error) {
 
 	for _, p := range profiles {
 		p.refresh = NewRefresher(p, client, cfg, log)
+		if p.UpstreamTimeout > 0 {
+			// Long-running upstreams (apify sync actor runs) get their own
+			// client; the shared 30s one would kill them mid-run.
+			p.client = &http.Client{Transport: tr, Timeout: p.UpstreamTimeout}
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -47,6 +52,8 @@ func buildServer() (*http.Server, error) {
 		"keys", len(cfg.APIKeys), "upstream", cfg.Upstream, "maxPasses", cfg.MaxPasses,
 		"tavilyKeys", len(cfg.Tavily.APIKeys), "tavilyUpstream", cfg.Tavily.Upstream,
 		"tavilyPrefix", cfg.Tavily.RoutePrefix,
+		"apifyKeys", len(cfg.Apify.APIKeys), "apifyUpstream", cfg.Apify.Upstream,
+		"apifyPrefix", cfg.Apify.RoutePrefix, "apifyTimeoutSec", cfg.Apify.TimeoutSec,
 		"creditResetDay", cfg.CreditResetDay,
 		"lowCreditThreshold", cfg.LowCreditThreshold,
 		"stopCreditThreshold", cfg.StopCreditThreshold,

@@ -1,8 +1,8 @@
 # api-key-rotator
 
-A multi-provider API key rotation reverse proxy. Supports **Firecrawl** and
-**Tavily** profiles — each with its own key pool, upstream, route prefix, and
-rotation policy.
+A multi-provider API key rotation reverse proxy. Supports **Firecrawl**,
+**Tavily**, and **Apify** profiles — each with its own key pool, upstream,
+route prefix, and rotation policy.
 
 ## Why
 
@@ -59,6 +59,10 @@ firecrawl:                     # your existing mcpo + firecrawl-mcp service
 | `TAVILY_ROUTE_PREFIX` | `/tavily` | Route prefix that selects the Tavily profile. Stripped before forwarding. |
 | `TAVILY_LOW_CREDIT_THRESHOLD` | `10` | Same as `LOW_CREDIT_THRESHOLD` but for the Tavily key pool. |
 | `TAVILY_STOP_CREDIT_THRESHOLD` | `2` | Same as `STOP_CREDIT_THRESHOLD` but for the Tavily key pool. |
+| `APIFY_API_KEYS` | (unset) | Comma-separated Apify token pool. When set, enables the Apify profile. |
+| `APIFY_UPSTREAM` | `https://api.apify.com` | Upstream Apify API base. |
+| `APIFY_ROUTE_PREFIX` | `/v2/acts` | Route prefix that selects the Apify profile. **Kept** in the forwarded path (Apify's real API lives under `/v2/acts`). Note: this shadows those specific paths on the Firecrawl default profile; other `/v2/*` paths are unaffected. |
+| `APIFY_TIMEOUT_SEC` | `180` | Upstream client timeout for the Apify profile. Synchronous actor runs take 30-120s, so this must comfortably exceed `timeout=` in the request URL. |
 | `LOG_LEVEL` | `info` | `debug` adds per-request lines. |
 
 ## Endpoints
@@ -163,6 +167,44 @@ Tavily. Requests whose path starts with `TAVILY_ROUTE_PREFIX` (default
 - **Credit thresholds**: `TAVILY_LOW_CREDIT_THRESHOLD` and
   `TAVILY_STOP_CREDIT_THRESHOLD` mirror the Firecrawl thresholds but
   apply to the Tavily pool independently.
+
+## Apify profile
+
+When `APIFY_API_KEYS` is set, the proxy creates a separate token pool for
+Apify. Requests whose path starts with `APIFY_ROUTE_PREFIX` (default
+`/v2/acts`) are routed to `https://api.apify.com`:
+
+- **Auth is a query param, not a header.** Clients put `?token=...` in the
+  URL (or omit it); the rotator replaces/adds the `token` query parameter
+  with the pooled token on every attempt. Any client-sent `Authorization`
+  header is dropped. The rest of the query string (`timeout=120`, ...) is
+  preserved verbatim.
+- **Prefix is kept, not stripped.** A request to
+  `/v2/acts/{user}~{actor}/run-sync-get-dataset-items` is forwarded to
+  `{APIFY_UPSTREAM}/v2/acts/{user}~{actor}/run-sync-get-dataset-items`
+  unchanged.
+- **Long timeout.** The Apify profile gets its own HTTP client with
+  `APIFY_TIMEOUT_SEC` (default 180s) instead of the shared 30s, because
+  synchronous actor runs take 30-120s.
+- **Rotation policy** (status codes only, body never scanned - a success is
+  a bare dataset-items *array* with no envelope): HTTP **401** and **429**
+  rotate (cool down ~30s) but do not disable. HTTP **402** disables the
+  token until the `CREDIT_RESET_DAY` fallback (Apify has no read-only usage
+  endpoint to auto-detect the reset instant). **403** stays transient:
+  retried on the same token with backoff like every profile.
+- **No credit tracking.** Apify exposes no cheap per-token usage endpoint,
+  so tokens stay "unmeasured" (`remainingCredits: -1` in `/status`); the
+  warm-up/daily refresh loops are no-ops for this profile, and selection is
+  first-usable-token with cooldown rotation.
+
+Client usage (no SDK, plain HTTP):
+
+```bash
+curl -X POST "http://localhost:8788/v2/acts/apimaestro~linkedin-posts-search-scraper-no-cookies/run-sync-get-dataset-items?timeout=120" \
+  -H "Content-Type: application/json" \
+  -d '{"searchUrl":"https://www.linkedin.com/search/results/content/?keywords=ai"}'
+# ?token= is optional - the rotator injects/replaces it from APIFY_API_KEYS.
+```
 
 ## OpenWebUI + Tavily
 
