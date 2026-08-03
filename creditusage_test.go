@@ -9,12 +9,12 @@ import (
 )
 
 // TestFetchUsage_RetriesOn5xx: a transient 503 is retried and succeeds when the
-// server later returns 200.
+// server later returns 200. usageBackoff is an atomic.Value, so shrinking it
+// here is race-free even though refresh goroutines read it off the request path.
 func TestFetchUsage_RetriesOn5xx(t *testing.T) {
-	// Speed up: shrink backoff for the test.
-	orig := usageBackoff
-	usageBackoff = []time.Duration{1 * time.Millisecond, 1 * time.Millisecond, 1 * time.Millisecond}
-	defer func() { usageBackoff = orig }()
+	orig := usageBackoffSchedule()
+	usageBackoff.Store([]time.Duration{1 * time.Millisecond, 1 * time.Millisecond, 1 * time.Millisecond})
+	defer usageBackoff.Store(orig)
 
 	var hits int32
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -90,10 +90,11 @@ func TestFetchApifyUsage_Unauthorized(t *testing.T) {
 }
 
 // TestFetchApifyUsage_RetriesOn5xx: transient 503 retried until 200.
+// usageBackoff is an atomic.Value, so shrinking it here is race-free.
 func TestFetchApifyUsage_RetriesOn5xx(t *testing.T) {
-	orig := usageBackoff
-	usageBackoff = []time.Duration{1 * time.Millisecond, 1 * time.Millisecond, 1 * time.Millisecond}
-	defer func() { usageBackoff = orig }()
+	orig := usageBackoffSchedule()
+	usageBackoff.Store([]time.Duration{1 * time.Millisecond, 1 * time.Millisecond, 1 * time.Millisecond})
+	defer usageBackoff.Store(orig)
 
 	var hits int32
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

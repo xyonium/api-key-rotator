@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,10 +26,21 @@ type usage struct {
 // usageBackoff is the retry schedule for TRANSIENT credit-usage failures only
 // (network errors, 408, 5xx). Permanent failures (404/401/403/400) are not
 // retried - they usually mean the key's account can't access this endpoint.
-var usageBackoff = []time.Duration{
-	500 * time.Millisecond,
-	1 * time.Second,
-	2 * time.Second,
+// Stored in an atomic.Value because usage-refresh goroutines read it off the
+// request path while tests override it; a plain package var races under -race.
+var usageBackoff atomic.Value // []time.Duration
+
+func init() {
+	usageBackoff.Store([]time.Duration{
+		500 * time.Millisecond,
+		1 * time.Second,
+		2 * time.Second,
+	})
+}
+
+// usageBackoffSchedule returns the current usage retry schedule.
+func usageBackoffSchedule() []time.Duration {
+	return usageBackoff.Load().([]time.Duration)
 }
 
 // usageRetryable reports whether a non-200 status is worth retrying.
@@ -55,7 +67,8 @@ func fetchUsage(client *http.Client, upstream, key string, log *logger) usage {
 	}
 
 	var lastReason string
-	for attempt := 0; attempt <= len(usageBackoff); attempt++ {
+	backoff := usageBackoffSchedule()
+	for attempt := 0; attempt <= len(backoff); attempt++ {
 		u, reason := fetchUsageOnce(c, upstream, key)
 		if u.ok {
 			return u
@@ -64,10 +77,10 @@ func fetchUsage(client *http.Client, upstream, key string, log *logger) usage {
 		// Retry only transient reasons. fetchUsageOnce returns reason prefixed
 		// "status:" for non-200 and "net:" for network errors; we retry those
 		// (status that is retryable, or any net error) but not permanent status.
-		if !shouldRetryUsage(reason) || attempt >= len(usageBackoff) {
+		if !shouldRetryUsage(reason) || attempt >= len(backoff) {
 			break
 		}
-		time.Sleep(usageBackoff[attempt])
+		time.Sleep(backoff[attempt])
 	}
 	if log != nil {
 		log.warn("credit-usage fetch failed", "reason", lastReason, "masked", maskKey(key))
@@ -161,16 +174,17 @@ func fetchApifyUsage(client *http.Client, p *Profile, key string, log *logger) u
 	}
 
 	var lastReason string
-	for attempt := 0; attempt <= len(usageBackoff); attempt++ {
+	backoff := usageBackoffSchedule()
+	for attempt := 0; attempt <= len(backoff); attempt++ {
 		u, reason := fetchApifyUsageOnce(c, p, key)
 		if u.ok {
 			return u
 		}
 		lastReason = reason
-		if !shouldRetryUsage(reason) || attempt >= len(usageBackoff) {
+		if !shouldRetryUsage(reason) || attempt >= len(backoff) {
 			break
 		}
-		time.Sleep(usageBackoff[attempt])
+		time.Sleep(backoff[attempt])
 	}
 	if log != nil {
 		log.warn("apify limits fetch failed", "reason", lastReason, "masked", maskKey(key))
@@ -239,16 +253,17 @@ func fetchTavilyUsage(client *http.Client, upstream, key string, log *logger) us
 	}
 
 	var lastReason string
-	for attempt := 0; attempt <= len(usageBackoff); attempt++ {
+	backoff := usageBackoffSchedule()
+	for attempt := 0; attempt <= len(backoff); attempt++ {
 		u, reason := fetchTavilyUsageOnce(c, upstream, key)
 		if u.ok {
 			return u
 		}
 		lastReason = reason
-		if !shouldRetryUsage(reason) || attempt >= len(usageBackoff) {
+		if !shouldRetryUsage(reason) || attempt >= len(backoff) {
 			break
 		}
-		time.Sleep(usageBackoff[attempt])
+		time.Sleep(backoff[attempt])
 	}
 	if log != nil {
 		log.warn("tavily usage fetch failed", "reason", lastReason, "masked", maskKey(key))

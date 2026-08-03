@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -48,9 +49,9 @@ func TestRefresher_LowIntervalFromConfig(t *testing.T) {
 // TestRefresher_RefreshAllFetchesUsage confirms RefreshAll hits credit-usage and
 // sets remainingCredits on the pool.
 func TestRefresher_RefreshAllFetchesUsage(t *testing.T) {
-	hits := 0
+	var hits int32
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
+		atomic.AddInt32(&hits, 1)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"success":true,"data":{"remainingCredits":4242,"billingPeriodEnd":"2026-08-01T00:00:00Z"}}`))
 	}))
@@ -68,8 +69,8 @@ func TestRefresher_RefreshAllFetchesUsage(t *testing.T) {
 	r := NewRefresher(p, &http.Client{}, cfg, newLogger("info"))
 	r.RefreshAll()
 
-	if hits != 2 {
-		t.Fatalf("credit-usage hits = %d, want 2 (one per key)", hits)
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("credit-usage hits = %d, want 2 (one per key)", got)
 	}
 	snap := pool.Snapshot()
 	if snap.Keys[0].RemainingCredits != 4242 || snap.Keys[1].RemainingCredits != 4242 {
