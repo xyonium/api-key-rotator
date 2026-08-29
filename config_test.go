@@ -9,7 +9,7 @@ import (
 
 func TestLoadConfig_defaults(t *testing.T) {
 	t.Setenv("FIRECRAWL_API_KEYS", "fc-a, fc-b ,, fc-c")
-	for _, k := range []string{"UPSTREAM", "PORT", "HOST", "MAX_PASSES", "MAX_BODY_BYTES", "PROXY_BASE_URL", "UPSTREAM_PROXY", "LOG_LEVEL", "CREDIT_RESET_DAY", "LOW_CREDIT_THRESHOLD", "STOP_CREDIT_THRESHOLD", "CREDIT_REFRESH_INTERVAL", "TAVILY_API_KEYS", "TAVILY_UPSTREAM", "TAVILY_ROUTE_PREFIX", "TAVILY_LOW_CREDIT_THRESHOLD", "TAVILY_STOP_CREDIT_THRESHOLD", "APIFY_API_KEYS", "APIFY_UPSTREAM", "APIFY_ROUTE_PREFIX", "APIFY_TIMEOUT_SEC", "APIFY_FREE_CREDIT_USD", "APIFY_LOW_CREDIT_USD", "APIFY_STOP_CREDIT_USD", "FIRECRAWL_MAX_CONCURRENT_PER_KEY", "FIRECRAWL_CONCURRENCY_SATURATION", "FIRECRAWL_CONCURRENCY_QUEUE_MS", "FIRECRAWL_403_RETRIES"} {
+	for _, k := range []string{"UPSTREAM", "PORT", "HOST", "MAX_PASSES", "MAX_BODY_BYTES", "PROXY_BASE_URL", "UPSTREAM_PROXY", "LOG_LEVEL", "CREDIT_RESET_DAY", "LOW_CREDIT_THRESHOLD", "STOP_CREDIT_THRESHOLD", "CREDIT_REFRESH_INTERVAL", "TAVILY_API_KEYS", "TAVILY_UPSTREAM", "TAVILY_ROUTE_PREFIX", "TAVILY_LOW_CREDIT_THRESHOLD", "TAVILY_STOP_CREDIT_THRESHOLD", "APIFY_API_KEYS", "APIFY_UPSTREAM", "APIFY_ROUTE_PREFIX", "APIFY_TIMEOUT_SEC", "APIFY_FREE_CREDIT_USD", "APIFY_LOW_CREDIT_USD", "APIFY_STOP_CREDIT_USD", "EXA_API_KEYS", "EXA_UPSTREAM", "EXA_ROUTE_PREFIX", "EXA_BUDGET_USD", "EXA_LOW_CREDIT_USD", "EXA_STOP_CREDIT_USD", "FIRECRAWL_MAX_CONCURRENT_PER_KEY", "FIRECRAWL_CONCURRENCY_SATURATION", "FIRECRAWL_CONCURRENCY_QUEUE_MS", "FIRECRAWL_403_RETRIES"} {
 		t.Setenv(k, "")
 	}
 	cfg, err := LoadConfig()
@@ -17,22 +17,22 @@ func TestLoadConfig_defaults(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	want := Config{
-		APIKeys:       []string{"fc-a", "fc-b", "fc-c"}, // trimmed, empties dropped
-		Upstream:      "https://api.firecrawl.dev",
-		UpstreamHost:  "api.firecrawl.dev",
-		Port:          "8788",
-		Host:          "0.0.0.0",
-		MaxPasses:     2,
-		MaxBodyBytes:  16 * 1024 * 1024,
-		LogLevel:      "info",
-		CreditResetDay: 1,
-		LowCreditThreshold: 10,
-		StopCreditThreshold: 2,
-		CreditRefreshSec: 300,
-		FirecrawlMaxConcurrentPerKey: 1,
+		APIKeys:                        []string{"fc-a", "fc-b", "fc-c"}, // trimmed, empties dropped
+		Upstream:                       "https://api.firecrawl.dev",
+		UpstreamHost:                   "api.firecrawl.dev",
+		Port:                           "8788",
+		Host:                           "0.0.0.0",
+		MaxPasses:                      2,
+		MaxBodyBytes:                   16 * 1024 * 1024,
+		LogLevel:                       "info",
+		CreditResetDay:                 1,
+		LowCreditThreshold:             10,
+		StopCreditThreshold:            2,
+		CreditRefreshSec:               300,
+		FirecrawlMaxConcurrentPerKey:   1,
 		FirecrawlConcurrencySaturation: "queue",
-		FirecrawlConcurrencyQueueMs: 15000,
-		Firecrawl403Retries: 1,
+		FirecrawlConcurrencyQueueMs:    15000,
+		Firecrawl403Retries:            1,
 		Tavily: TavilyConfig{
 			APIKeys:     nil,
 			Upstream:    "https://api.tavily.com",
@@ -44,12 +44,23 @@ func TestLoadConfig_defaults(t *testing.T) {
 			// is what turned one client request into ~48 upstream hits.
 			Retries403: 1,
 		},
+		Exa: ExaConfig{
+			APIKeys:     nil,
+			Upstream:    "https://api.exa.ai",
+			RoutePrefix: "/exa",
+			// $10 free-tier monthly credits, tracked in MICRO-USD (a search
+			// costs $0.007 = 0 cents but 7000 microUSD, so cents would never
+			// decrement and the profile would never auto-stop).
+			BudgetMicro: 10_000_000,
+			LowMicro:    500_000,
+			StopMicro:   100_000,
+		},
 		Apify: ApifyConfig{
-			APIKeys:        nil,
-			Upstream:       "https://api.apify.com",
-			RoutePrefix:    "/v2/acts",
-			TimeoutSec:     180,
-			FreeCreditUsd:  0, // 0 = no override: use the account's own included monthly credit
+			APIKeys:         nil,
+			Upstream:        "https://api.apify.com",
+			RoutePrefix:     "/v2/acts",
+			TimeoutSec:      180,
+			FreeCreditUsd:   0, // 0 = no override: use the account's own included monthly credit
 			LowCreditCents:  10,
 			StopCreditCents: 5,
 		},
@@ -413,5 +424,128 @@ func TestLoadConfig_apifyBadCreditThresholdsError(t *testing.T) {
 	t.Setenv("APIFY_STOP_CREDIT_USD", "0.20")
 	if _, err := LoadConfig(); err == nil {
 		t.Fatal("expected error when APIFY_STOP > APIFY_LOW, got nil")
+	}
+}
+
+func TestLoadConfig_exaKeysParsed(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	t.Setenv("EXA_API_KEYS", "exa-1, exa-2 ,, exa-3")
+	t.Setenv("EXA_UPSTREAM", "https://exa.internal:8443")
+	t.Setenv("EXA_ROUTE_PREFIX", "/exasearch")
+	t.Setenv("EXA_BUDGET_USD", "25.50")
+	t.Setenv("EXA_LOW_CREDIT_USD", "1.25")
+	t.Setenv("EXA_STOP_CREDIT_USD", "0.25")
+	t.Setenv("TAVILY_API_KEYS", "")
+	t.Setenv("APIFY_API_KEYS", "")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cfg.Exa.APIKeys) != 3 {
+		t.Fatalf("exa keys = %v, want 3", cfg.Exa.APIKeys)
+	}
+	if cfg.Exa.Upstream != "https://exa.internal:8443" {
+		t.Fatalf("exa upstream = %q", cfg.Exa.Upstream)
+	}
+	if cfg.Exa.RoutePrefix != "/exasearch" {
+		t.Fatalf("exa prefix = %q", cfg.Exa.RoutePrefix)
+	}
+	// USD -> microUSD: 25.50 -> 25_500_000, 1.25 -> 1_250_000, 0.25 -> 250_000
+	if cfg.Exa.BudgetMicro != 25_500_000 {
+		t.Fatalf("BudgetMicro = %d, want 25_500_000", cfg.Exa.BudgetMicro)
+	}
+	if cfg.Exa.LowMicro != 1_250_000 {
+		t.Fatalf("LowMicro = %d, want 1_250_000", cfg.Exa.LowMicro)
+	}
+	if cfg.Exa.StopMicro != 250_000 {
+		t.Fatalf("StopMicro = %d, want 250_000", cfg.Exa.StopMicro)
+	}
+}
+
+func TestLoadConfig_exaStopAboveLowErrors(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	t.Setenv("EXA_API_KEYS", "exa-1")
+	t.Setenv("EXA_LOW_CREDIT_USD", "0.10")
+	t.Setenv("EXA_STOP_CREDIT_USD", "0.50")
+	t.Setenv("TAVILY_API_KEYS", "")
+	t.Setenv("APIFY_API_KEYS", "")
+
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("expected error when EXA_STOP_CREDIT_USD > EXA_LOW_CREDIT_USD")
+	}
+}
+
+func TestLoadConfig_exaBadUpstreamErrors(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	t.Setenv("EXA_API_KEYS", "exa-1")
+	t.Setenv("EXA_UPSTREAM", "not-a-url")
+	t.Setenv("TAVILY_API_KEYS", "")
+	t.Setenv("APIFY_API_KEYS", "")
+
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("expected error for an invalid EXA_UPSTREAM")
+	}
+}
+
+func TestLoadConfig_exaBadPrefixErrors(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	t.Setenv("EXA_API_KEYS", "exa-1")
+	t.Setenv("TAVILY_API_KEYS", "")
+	t.Setenv("APIFY_API_KEYS", "")
+	for _, bad := range []string{"exa", "/exa/", "/", "/healthz", "/status"} {
+		t.Setenv("EXA_ROUTE_PREFIX", bad)
+		if _, err := LoadConfig(); err == nil {
+			t.Errorf("EXA_ROUTE_PREFIX %q should be rejected", bad)
+		}
+	}
+}
+
+func TestLoadConfig_exaZeroBudgetErrors(t *testing.T) {
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	t.Setenv("EXA_API_KEYS", "exa-1")
+	t.Setenv("EXA_BUDGET_USD", "0")
+	t.Setenv("TAVILY_API_KEYS", "")
+	t.Setenv("APIFY_API_KEYS", "")
+
+	if _, err := LoadConfig(); err == nil {
+		t.Fatal("expected error for EXA_BUDGET_USD = 0 (a zero budget would 503 every request immediately)")
+	}
+}
+
+// TestEnvUsdMicro guards the precision the whole Exa profile depends on: a
+// search costs $0.007, which is 0 cents.
+func TestEnvUsdMicro(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int64
+	}{
+		{"10", 10_000_000},
+		{"0.007", 7000},
+		{"0.0025", 2500},
+		{"1.25", 1_250_000},
+		{"0", 0},
+	}
+	for _, tc := range cases {
+		t.Setenv("EXA_TEST_USD", tc.in)
+		got, err := envUsdMicro("EXA_TEST_USD", -1)
+		if err != nil {
+			t.Fatalf("envUsdMicro(%q): %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Errorf("envUsdMicro(%q) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+	// Unset -> default
+	t.Setenv("EXA_TEST_USD", "")
+	if got, _ := envUsdMicro("EXA_TEST_USD", 777); got != 777 {
+		t.Errorf("unset envUsdMicro = %d, want default 777", got)
+	}
+	// Negative / non-numeric are rejected
+	for _, bad := range []string{"-1", "abc"} {
+		t.Setenv("EXA_TEST_USD", bad)
+		if _, err := envUsdMicro("EXA_TEST_USD", 0); err == nil {
+			t.Errorf("envUsdMicro(%q) should error", bad)
+		}
 	}
 }

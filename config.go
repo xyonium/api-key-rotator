@@ -34,6 +34,7 @@ type Config struct {
 	Firecrawl403Retries           int    // same-key retries on a 403 before rotating (default 1; 0 = legacy full backoff)
 	Tavily              TavilyConfig
 	Apify               ApifyConfig
+	Exa                            ExaConfig
 }
 
 // TavilyConfig holds the Tavily profile's settings. The profile is disabled
@@ -50,6 +51,29 @@ type TavilyConfig struct {
 	// keys turns one client request into ~48 upstream hits and deepens the
 	// block. Defaults to the firecrawl 403 budget.
 	Retries403 int
+}
+
+// ExaConfig holds the Exa profile's settings. The profile is disabled when
+// APIKeys is empty.
+//
+// Exa exposes NO balance endpoint (probed GET /billing /usage /account
+// /credits /me /key on api.exa.ai -> all 404; the only usage API is
+// admin-api.exa.ai, which needs a separate service key and returns *spend*, not
+// remaining). So the balance is ACCOUNTED, not read: each key starts at
+// BudgetMicro and is decremented by costDollars.total on every response.
+//
+// All money fields are in MICRO-USD (millionths of a dollar). Exa prices a
+// search at $0.007, and int(0.007*100) == 0, so a cents-denominated balance
+// would never decrement at all - the key would sit at a full budget forever and
+// never auto-stop. Micro-USD keeps $0.007 exactly (7000) and still fits int64
+// ($10 = 10_000_000).
+type ExaConfig struct {
+	APIKeys     []string
+	Upstream    string
+	RoutePrefix string
+	BudgetMicro int64 // starting (and reset) balance in microUSD; default 10_000_000 ($10 free tier)
+	LowMicro    int64 // rotate off a key below this; default 500_000 ($0.50)
+	StopMicro   int64 // 503 when every key is below this; default 100_000 ($0.10)
 }
 
 // ApifyConfig holds the Apify profile's settings. The profile is disabled
@@ -211,6 +235,11 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 
+	exa, err := loadExaConfig()
+	if err != nil {
+		return Config{}, err
+	}
+
 	maxConc, err := envInt("FIRECRAWL_MAX_CONCURRENT_PER_KEY", 1)
 	if err != nil {
 		return Config{}, err
@@ -234,6 +263,7 @@ func LoadConfig() (Config, error) {
 		APIKeys:       keys,
 		Tavily:        tavily,
 		Apify:         apify,
+		Exa:                            exa,
 		Upstream:      strings.TrimRight(upstream, "/"),
 		UpstreamHost:  u.Host,
 		Port:          envStr("PORT", "8788"),
@@ -357,6 +387,75 @@ func loadApifyConfig() (ApifyConfig, error) {
 	}
 	a.LowCreditCents, a.StopCreditCents = low, stop
 	return a, nil
+}
+
+// loadExaConfig parses the EXA_* env vars. The route prefix must start with
+// '/', must not end with '/', and must not shadow the reserved /healthz or
+// /status paths.
+//
+// Budget and thresholds are configured in USD (EXA_BUDGET_USD etc.) and stored
+// in microUSD. The default budget is the free tier's $10/month: Exa exposes no
+// endpoint reporting remaining credits, so this is the starting balance the
+// rotator accounts spend against.
+func loadExaConfig() (ExaConfig, error) {
+	e := ExaConfig{
+		APIKeys:     parseKeys(os.Getenv("EXA_API_KEYS")),
+		RoutePrefix: envStr("EXA_ROUTE_PREFIX", "/exa"),
+		BudgetMicro: 10_000_000, // $10 (free tier monthly credits)
+		LowMicro:    500_000,    // $0.50
+		StopMicro:   100_000,    // $0.10
+	}
+
+	upstream := envStr("EXA_UPSTREAM", "https://api.exa.ai")
+	eu, err := url.Parse(upstream)
+	if err != nil || eu.Host == "" || (eu.Scheme != "http" && eu.Scheme != "https") {
+		return ExaConfig{}, fmt.Errorf("EXA_UPSTREAM %q is not a valid http(s) URL", upstream)
+	}
+	e.Upstream = strings.TrimRight(upstream, "/")
+
+	if !strings.HasPrefix(e.RoutePrefix, "/") || len(e.RoutePrefix) < 2 || strings.HasSuffix(e.RoutePrefix, "/") {
+		return ExaConfig{}, fmt.Errorf("EXA_ROUTE_PREFIX %q must start with '/' and be a non-root path without trailing slash", e.RoutePrefix)
+	}
+	if e.RoutePrefix == "/healthz" || e.RoutePrefix == "/status" {
+		return ExaConfig{}, fmt.Errorf("EXA_ROUTE_PREFIX %q shadows a reserved path", e.RoutePrefix)
+	}
+
+	budget, err := envUsdMicro("EXA_BUDGET_USD", e.BudgetMicro)
+	if err != nil {
+		return ExaConfig{}, err
+	}
+	low, err := envUsdMicro("EXA_LOW_CREDIT_USD", e.LowMicro)
+	if err != nil {
+		return ExaConfig{}, err
+	}
+	stop, err := envUsdMicro("EXA_STOP_CREDIT_USD", e.StopMicro)
+	if err != nil {
+		return ExaConfig{}, err
+	}
+	if stop > low {
+		return ExaConfig{}, fmt.Errorf("EXA_STOP_CREDIT_USD (%d microUSD) must be <= EXA_LOW_CREDIT_USD (%d microUSD)", stop, low)
+	}
+	if budget <= 0 {
+		return ExaConfig{}, fmt.Errorf("EXA_BUDGET_USD must be greater than 0, got %d microUSD", budget)
+	}
+	e.BudgetMicro, e.LowMicro, e.StopMicro = budget, low, stop
+	return e, nil
+}
+
+// envUsdMicro parses a USD amount from an env var into integer MICRO-USD
+// (millionths of a dollar), returning def (already microUSD) when unset.
+// Exa prices a search at $0.007, which is 0 cents but 7000 microUSD - the
+// precision is the whole point (see ExaConfig).
+func envUsdMicro(key string, defMicro int64) (int64, error) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return defMicro, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative number (USD), got %q", key, v)
+	}
+	return int64(math.Round(f * 1_000_000)), nil
 }
 
 // envUsd parses a non-negative USD amount from an env var, returning def when unset.

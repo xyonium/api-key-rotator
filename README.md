@@ -1,7 +1,7 @@
 # api-key-rotator
 
 A multi-provider API key rotation reverse proxy. Supports **Firecrawl**,
-**Tavily**, and **Apify** profiles — each with its own key pool, upstream,
+**Tavily**, **Apify**, and **Exa** profiles — each with its own key pool, upstream,
 route prefix, and rotation policy.
 
 ## Why
@@ -63,6 +63,12 @@ firecrawl:                     # your existing mcpo + firecrawl-mcp service
 | `TAVILY_ROUTE_PREFIX` | `/tavily` | Route prefix that selects the Tavily profile. Stripped before forwarding. |
 | `TAVILY_LOW_CREDIT_THRESHOLD` | `10` | Same as `LOW_CREDIT_THRESHOLD` but for the Tavily key pool. |
 | `TAVILY_STOP_CREDIT_THRESHOLD` | `2` | Same as `STOP_CREDIT_THRESHOLD` but for the Tavily key pool. |
+| `EXA_API_KEYS` | (unset) | Comma-separated Exa key pool. When set, enables the Exa profile. |
+| `EXA_UPSTREAM` | `https://api.exa.ai` | Upstream Exa API base. |
+| `EXA_ROUTE_PREFIX` | `/exa` | Route prefix that selects the Exa profile. Stripped before forwarding. |
+| `EXA_BUDGET_USD` | `10.00` | Monthly credit budget per key (the free tier's $10). Exa exposes **no** balance endpoint, so the rotator accounts spend against this. |
+| `EXA_LOW_CREDIT_USD` | `0.50` | Rotate off a key when its accounted balance drops below this. |
+| `EXA_STOP_CREDIT_USD` | `0.10` | Stop serving (503) when every Exa key is below this. |
 | `APIFY_API_KEYS` | (unset) | Comma-separated Apify token pool. When set, enables the Apify profile. |
 | `APIFY_UPSTREAM` | `https://api.apify.com` | Upstream Apify API base. |
 | `APIFY_ROUTE_PREFIX` | `/v2/acts` | Route prefix that selects the Apify profile. **Kept** in the forwarded path (Apify's real API lives under `/v2/acts`). Note: this shadows those specific paths on the Firecrawl default profile; other `/v2/*` paths are unaffected. |
@@ -88,7 +94,9 @@ no credits):
   starts immediately; until this completes, unmeasured keys are assumed plentiful).
 - **On success**: decrements the used key's predicted balance by the response's
   `creditsUsed` (or by 1 if that field is absent).
-- **On rotation**: refreshes the keys we switched off and onto.
+- **On rotation**: refreshes the keys we switched off and onto (only when the
+  rotation reason could have changed the balance, and skipped entirely for the Exa
+  profile, which has no balance endpoint).
 - **Low balance**: when a key's *predicted* balance drops below 100, it is
   refreshed at most once per `CREDIT_REFRESH_INTERVAL` (default 5 min) to correct
   estimation drift.
@@ -126,7 +134,7 @@ risks account flags. The rotator now **respects per-key concurrency**:
   it 5× per key was the main churn driver. It still never disables the key.
   The same cap now applies to Tavily (see "Tavily profile" below).
 
-These apply to the Firecrawl profile only; Tavily and Apify are unchanged
+These apply to the Firecrawl profile only; Tavily, Apify, and Exa are unchanged
 (their pools run unlimited, as before).
 
 ## Rotation & retry behavior
@@ -219,6 +227,57 @@ Tavily. Requests whose path starts with `TAVILY_ROUTE_PREFIX` (default
 - **Credit thresholds**: `TAVILY_LOW_CREDIT_THRESHOLD` and
   `TAVILY_STOP_CREDIT_THRESHOLD` mirror the Firecrawl thresholds but
   apply to the Tavily pool independently.
+
+## Exa profile
+
+When `EXA_API_KEYS` is set, the proxy creates a separate key pool for Exa.
+Requests whose path starts with `EXA_ROUTE_PREFIX` (default `/exa`) are routed to
+`https://api.exa.ai`:
+
+- **Prefix stripping**: the leading `/exa` is removed before forwarding. A
+  request to `/exa/search` hits `{EXA_UPSTREAM}/search`.
+- **Auth is the `x-api-key` header**, not `Authorization: Bearer`. The key is
+  sent as the bare header value, and any client-sent value is replaced. (`Bearer`
+  happens to work upstream but is undocumented, so the rotator does not rely on
+  it.)
+- **Rotation policy** (status codes only, body never scanned): HTTP **401**
+  (invalid key) and **429** (rate limit) rotate but do not disable. HTTP **402**
+  (credits exhausted - `NO_MORE_CREDITS` / `API_KEY_BUDGET_EXCEEDED` /
+  `TEAM_BUDGET_EXCEEDED`) **disables** the key until the `CREDIT_RESET_DAY`
+  fallback. **403** stays transient: retried on the same key with backoff, never
+  disabled. Exa search results contain arbitrary scraped page text (which can
+  contain "insufficient credits", "rate limit", ...), so the body is never
+  consulted.
+- **Balances are accounted, not read.** Exa exposes no balance endpoint (probed
+  `/billing`, `/usage`, `/account`, `/credits`, `/me`, `/key` on `api.exa.ai` -
+  all 404; the only usage API lives on `admin-api.exa.ai`, needs a separate
+  *service* key, and reports **spend** rather than remaining credits). So each
+  key starts at `EXA_BUDGET_USD` and is decremented by every response's
+  `costDollars.total`. Consequences:
+  - **Restarting the container resets each key to the full budget.** A mid-month
+    restart therefore *over-estimates* the remaining balance. This cannot cause a
+    false 503 - only extra spend until a real 402 arrives, which is
+    authoritative.
+  - `costDollars` is an official **estimate** ("billing is computed from usage
+    counters rather than this response object"), so drift is expected.
+- **Money is tracked in micro-USD** (millionths of a dollar) internally. A
+  search costs $0.007, and `int(0.007 * 100) == 0`, so a cents-denominated
+  balance would never decrement at all. The env vars stay in USD.
+- **No `next`-URL rewriting.** Exa's `/search` returns no pagination cursor, and
+  a real response contains zero `api.exa.ai` URLs (result URLs point at
+  third-party pages), so there is nothing to rewrite.
+- **No per-key concurrency cap.** Exa's documented limits are QPS-level
+  (`/search` 10 QPS, `/contents` 100 QPS), not concurrency-level. The existing
+  429-rotate and `Retry-After` cooldown handle throttling.
+
+Client usage:
+
+```bash
+curl -X POST http://localhost:8788/exa/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"kubernetes best practices","numResults":5,"type":"fast"}'
+# no auth header needed - the rotator injects x-api-key from EXA_API_KEYS.
+```
 
 ## Apify profile
 

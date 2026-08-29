@@ -11,7 +11,8 @@ func profilesForTest() []*Profile {
 	fc := &Profile{Name: "firecrawl", RoutePrefix: "", pool: NewKeyPool([]string{"fc-a"})}
 	tv := &Profile{Name: "tavily", RoutePrefix: "/tavily", pool: NewKeyPool([]string{"tvly-a"})}
 	ap := &Profile{Name: "apify", RoutePrefix: "/v2/acts", KeepPrefix: true, AuthQueryParam: "token", pool: NewKeyPool([]string{"apify-a"})}
-	return []*Profile{fc, tv, ap}
+	ex := &Profile{Name: "exa", RoutePrefix: "/exa", AuthHeader: "x-api-key", pool: NewKeyPool([]string{"exa-a"})}
+	return []*Profile{fc, tv, ap, ex}
 }
 
 func TestMatchProfile(t *testing.T) {
@@ -26,10 +27,13 @@ func TestMatchProfile(t *testing.T) {
 		{"/tavily/search", "tavily", "/search", true},
 		{"/tavily/extract", "tavily", "/extract", true},
 		{"/tavily", "tavily", "/", true},
-		{"/tavilyfoo/search", "firecrawl", "/tavilyfoo/search", true}, // no segment boundary -> default
+		{"/tavilyfoo/search", "firecrawl", "/tavilyfoo/search", true},                                         // no segment boundary -> default
 		{"/v2/acts/u~a/run-sync-get-dataset-items", "apify", "/v2/acts/u~a/run-sync-get-dataset-items", true}, // kept whole
-		{"/v2/acts", "apify", "/v2/acts", true}, // exact match also kept whole
-		{"/v2/actsfoo/x", "firecrawl", "/v2/actsfoo/x", true}, // no segment boundary -> default
+		{"/v2/acts", "apify", "/v2/acts", true},                                                               // exact match also kept whole
+		{"/v2/actsfoo/x", "firecrawl", "/v2/actsfoo/x", true},                                                 // no segment boundary -> default
+		{"/exa/search", "exa", "/search", true},
+		{"/exa", "exa", "/", true},
+		{"/exafoo/search", "firecrawl", "/exafoo/search", true}, // no segment boundary -> default
 		{"/", "firecrawl", "/", true},
 	}
 	for _, c := range cases {
@@ -164,10 +168,10 @@ func TestProfile_isCreditExhausted(t *testing.T) {
 
 func TestTavilyRemaining(t *testing.T) {
 	cases := []struct {
-		name                                    string
+		name                                 string
 		keyU, keyL, planU, planL, payU, payL *int64
-		want                                    int64
-		wantOK                                  bool
+		want                                 int64
+		wantOK                               bool
 	}{
 		{"all layers", ptr(150), ptr(1000), ptr(500), ptr(15000), ptr(25), ptr(100), 75, true},      // min(850, 14500, 75)
 		{"key layer smallest", ptr(990), ptr(1000), ptr(0), ptr(15000), ptr(0), ptr(100), 10, true}, // min(10, 15000, 100)
@@ -221,11 +225,11 @@ func TestFetchTavilyUsage(t *testing.T) {
 
 func TestBuildProfiles_firecrawlOnly(t *testing.T) {
 	cfg := Config{
-		APIKeys:            []string{"fc-a", "fc-b"},
-		Upstream:           "https://api.firecrawl.dev",
-		UpstreamHost:       "api.firecrawl.dev",
-		CreditResetDay:     3,
-		LowCreditThreshold: 10,
+		APIKeys:             []string{"fc-a", "fc-b"},
+		Upstream:            "https://api.firecrawl.dev",
+		UpstreamHost:        "api.firecrawl.dev",
+		CreditResetDay:      3,
+		LowCreditThreshold:  10,
 		StopCreditThreshold: 2,
 	}
 	profiles := buildProfiles(cfg)
@@ -250,15 +254,15 @@ func TestBuildProfiles_firecrawlOnly(t *testing.T) {
 // tavily/apify pools stay unlimited (maxConcurrent 0).
 func TestBuildProfiles_firecrawlConcurrencyConfigured(t *testing.T) {
 	cfg := Config{
-		APIKeys:            []string{"fc-a"},
-		Upstream:           "https://api.firecrawl.dev",
-		UpstreamHost:       "api.firecrawl.dev",
-		LowCreditThreshold: 10,
-		StopCreditThreshold: 2,
-		FirecrawlMaxConcurrentPerKey:     2,
-		FirecrawlConcurrencySaturation:   "reject",
-		FirecrawlConcurrencyQueueMs:      8000,
-		Firecrawl403Retries:              1,
+		APIKeys:                        []string{"fc-a"},
+		Upstream:                       "https://api.firecrawl.dev",
+		UpstreamHost:                   "api.firecrawl.dev",
+		LowCreditThreshold:             10,
+		StopCreditThreshold:            2,
+		FirecrawlMaxConcurrentPerKey:   2,
+		FirecrawlConcurrencySaturation: "reject",
+		FirecrawlConcurrencyQueueMs:    8000,
+		Firecrawl403Retries:            1,
 		Tavily: TavilyConfig{
 			APIKeys:     []string{"tvly-a"},
 			Upstream:    "https://api.tavily.com",
@@ -299,10 +303,10 @@ func TestBuildProfiles_firecrawlConcurrencyConfigured(t *testing.T) {
 
 func TestBuildProfiles_withTavily(t *testing.T) {
 	cfg := Config{
-		APIKeys:            []string{"fc-a"},
-		Upstream:           "https://api.firecrawl.dev",
-		UpstreamHost:       "api.firecrawl.dev",
-		LowCreditThreshold: 10,
+		APIKeys:             []string{"fc-a"},
+		Upstream:            "https://api.firecrawl.dev",
+		UpstreamHost:        "api.firecrawl.dev",
+		LowCreditThreshold:  10,
 		StopCreditThreshold: 2,
 		Tavily: TavilyConfig{
 			APIKeys:     []string{"tvly-a", "tvly-b"},
@@ -337,19 +341,19 @@ func TestBuildProfiles_withTavily(t *testing.T) {
 
 func TestBuildProfiles_withApify(t *testing.T) {
 	cfg := Config{
-		APIKeys:            []string{"fc-a"},
-		Upstream:           "https://api.firecrawl.dev",
-		UpstreamHost:       "api.firecrawl.dev",
-		LowCreditThreshold: 10,
+		APIKeys:             []string{"fc-a"},
+		Upstream:            "https://api.firecrawl.dev",
+		UpstreamHost:        "api.firecrawl.dev",
+		LowCreditThreshold:  10,
 		StopCreditThreshold: 2,
 		Apify: ApifyConfig{
-			APIKeys:          []string{"apify-a", "apify-b"},
-			Upstream:         "https://api.apify.com",
-			RoutePrefix:      "/v2/acts",
-			TimeoutSec:       180,
-			FreeCreditUsd:    7.5, // explicit override flows through to the profile
-			LowCreditCents:   10,
-			StopCreditCents:  5,
+			APIKeys:         []string{"apify-a", "apify-b"},
+			Upstream:        "https://api.apify.com",
+			RoutePrefix:     "/v2/acts",
+			TimeoutSec:      180,
+			FreeCreditUsd:   7.5, // explicit override flows through to the profile
+			LowCreditCents:  10,
+			StopCreditCents: 5,
 		},
 	}
 	profiles := buildProfiles(cfg)
@@ -426,5 +430,137 @@ func TestFetchTavilyUsage_unauthorized(t *testing.T) {
 	defer fake.Close()
 	if u := fetchTavilyUsage(fake.Client(), fake.URL, "bad", nil); u.ok {
 		t.Fatal("expected failure for 401")
+	}
+}
+
+func TestProfile_shouldRotate_exa(t *testing.T) {
+	p := &Profile{Name: "exa"}
+	// 401/402/429 rotate. Exa codes are unambiguous (verified by live probe:
+	// 401 INVALID_API_KEY, 402 NO_MORE_CREDITS, 429 RATE_LIMIT_EXCEEDED).
+	for _, st := range []int{401, 402, 429} {
+		if rotate, _ := p.shouldRotate(st, nil); !rotate {
+			t.Errorf("exa shouldRotate(%d) = false, want true", st)
+		}
+	}
+	// 403 stays transient (retried on the same key with backoff), like every
+	// other profile - it is never a rotation trigger and never disables.
+	for _, st := range []int{200, 400, 403, 404, 432, 433} {
+		if rotate, _ := p.shouldRotate(st, nil); rotate {
+			t.Errorf("exa shouldRotate(%d) = true, want false", st)
+		}
+	}
+	// Body text NEVER triggers rotation: Exa returns arbitrary scraped page
+	// text, which can contain any of these words.
+	for _, body := range []string{
+		`{"results":[{"title":"insufficient credits"}]}`,
+		`{"error":"payment required","tag":"NO_MORE_CREDITS"}`,
+		`{"results":[{"text":"rate limit exceeded"}]}`,
+	} {
+		if rotate, _ := p.shouldRotate(200, []byte(body)); rotate {
+			t.Errorf("exa shouldRotate(200, %s) = true, want false (status-only policy)", body)
+		}
+	}
+}
+
+func TestProfile_isCreditExhausted_exa(t *testing.T) {
+	p := &Profile{Name: "exa"}
+	if !p.isCreditExhausted(402, nil) {
+		t.Error("exa isCreditExhausted(402) = false, want true")
+	}
+	// 429 (rate limit) and 401 (bad key) rotate but must NOT disable.
+	for _, st := range []int{401, 429} {
+		if p.isCreditExhausted(st, nil) {
+			t.Errorf("exa isCreditExhausted(%d) = true, want false", st)
+		}
+	}
+	// Exa never disables on body text, whatever it says.
+	if p.isCreditExhausted(200, []byte(`{"error":"No more credits","tag":"NO_MORE_CREDITS"}`)) {
+		t.Error("exa isCreditExhausted(200 body) = true, want false")
+	}
+}
+
+// TestHasPeriodEnd guards disableUntilReset: Exa has no balance endpoint at
+// all, so it must use the CREDIT_RESET_DAY fallback and never issue a request
+// (which would 404 forever against api.exa.ai while warmupLoop retry-loops).
+func TestHasPeriodEnd(t *testing.T) {
+	cases := map[string]bool{
+		"firecrawl": true,  // /v2/team/credit-usage -> billingPeriodEnd
+		"apify":     true,  // /v2/users/me/limits -> monthlyUsageCycle.endAt
+		"tavily":    false, // /usage returns no period end
+		"exa":       false, // no balance endpoint at all
+	}
+	for name, want := range cases {
+		if got := hasPeriodEnd(name); got != want {
+			t.Errorf("hasPeriodEnd(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// TestFetchUsageFor_ExaNeverQueries proves the guard in fetchUsageFor: an exa
+// profile must never hit the network for a balance, even when the refresher
+// explicitly asks (warm-up, rotation, low-balance, daily).
+func TestFetchUsageFor_ExaNeverQueries(t *testing.T) {
+	var hits int32
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(404)
+	}))
+	defer fake.Close()
+
+	p := &Profile{Name: "exa", Upstream: fake.URL, UpstreamHost: httptestURLHost(fake.URL)}
+	u := fetchUsageFor(p, fake.Client(), "exa-a", newLogger("error"))
+	if u.ok {
+		t.Fatal("fetchUsageFor(exa) should report !ok (no balance exists)")
+	}
+	if got := hits; got != 0 {
+		t.Fatalf("upstream hits = %d, want 0 (exa must never query for a balance)", got)
+	}
+}
+
+func TestExtractExaCostMicro(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int64
+	}{
+		{"object (real shape)", `{"costDollars":{"total":0.007,"search":{"neural":0.007}}}`, 7000},
+		{"keyword price", `{"costDollars":{"total":0.0025}}`, 2500},
+		{"with results", `{"results":[{"title":"t"}],"costDollars":{"total":0.007}}`, 7000},
+		{"scalar (defensive)", `{"costDollars":0.007}`, -1},
+		{"null total", `{"costDollars":{"total":null}}`, -1},
+		{"missing", `{"results":[]}`, -1},
+		{"not JSON", `nope`, -1},
+		{"negative", `{"costDollars":{"total":-1}}`, -1},
+	}
+	for _, c := range cases {
+		if got := extractExaCostMicro([]byte(c.body)); got != c.want {
+			t.Errorf("%s: extractExaCostMicro = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// TestCostOf_Dispatch keeps the per-profile unit straight: exa returns
+// microUSD, everything else keeps the legacy creditsUsed (or -1 for the
+// 1-credit fallback).
+func TestCostOf_Dispatch(t *testing.T) {
+	exa := &Profile{Name: "exa"}
+	if got := costOf(exa, []byte(`{"costDollars":{"total":0.007}}`)); got != 7000 {
+		t.Errorf("costOf(exa) = %d, want 7000 microUSD", got)
+	}
+	// No cost reported -> 0, and the caller skips the decrement entirely
+	// (Decrement would coerce 0 into a 1-microUSD under-estimate).
+	if got := costOf(exa, []byte(`{"results":[]}`)); got != 0 {
+		t.Errorf("costOf(exa, no cost) = %d, want 0 (skip decrement)", got)
+	}
+	fc := &Profile{Name: "firecrawl"}
+	if got := costOf(fc, []byte(`{"success":true,"creditsUsed":3}`)); got != 3 {
+		t.Errorf("costOf(firecrawl) = %d, want 3 credits", got)
+	}
+	if got := costOf(fc, []byte(`{"success":true}`)); got != -1 {
+		t.Errorf("costOf(firecrawl, no creditsUsed) = %d, want -1 (1-credit fallback)", got)
+	}
+	// Exa must NOT pick up firecrawl's creditsUsed field.
+	if got := costOf(exa, []byte(`{"creditsUsed":3}`)); got != 0 {
+		t.Errorf("costOf(exa, creditsUsed body) = %d, want 0 (exa reads costDollars)", got)
 	}
 }

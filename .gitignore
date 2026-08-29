@@ -1,5 +1,6 @@
 /rotator
 /firecrawl-rotator
+/api-key-rotator
 /dist/
 *.test
 *.out

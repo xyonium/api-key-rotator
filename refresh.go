@@ -12,9 +12,10 @@ import (
 // pool tracks CENTS, so 100 credits would mean $1.00 - too coarse; apify uses
 // its own cent-denominated threshold derived from its low-water mark.
 const (
-	lowRefreshThreshold      = 100
-	apifyLowRefreshCents     = 100 // $1.00: re-check a low apify balance often
-	dailyRefresh             = 24 * time.Hour
+	lowRefreshThreshold  = 100
+	apifyLowRefreshCents = 100       // $1.00: re-check a low apify balance often
+	exaLowRefreshMicro   = 1_000_000 // $1.00 in microUSD (exa tracks microUSD, not cents)
+	dailyRefresh         = 24 * time.Hour
 )
 
 // Refresher applies the on-demand credit-refresh strategy to a KeyPool:
@@ -23,6 +24,7 @@ const (
 //   - refresh any key whose PREDICTED remaining has dropped below
 //     lowRefreshThreshold, throttled to once per lowInterval (CREDIT_REFRESH_INTERVAL),
 //   - refresh every key once per day as a catch-all.
+//
 // It never blocks the request path: refreshes run in their own goroutine.
 type Refresher struct {
 	profile     *Profile
@@ -68,11 +70,18 @@ func (r *Refresher) OnSwitch(fromIdx, toIdx int) {
 }
 
 // lowMark is the predicted-balance level below which MaybeRefreshLow kicks in.
-// Apify tracks cents, so it needs a cent-denominated mark; other profiles use
-// the shared credit mark.
+// The mark is in the profile's own unit, so each money-denominated profile
+// needs its own: apify tracks cents, exa tracks microUSD (a $1 mark there is
+// 1_000_000, since 100 microUSD is $0.0001 and would mean "never"). Others use
+// the shared whole-credit mark.
 func (r *Refresher) lowMark() int64 {
-	if r.profile != nil && r.profile.Name == "apify" {
-		return apifyLowRefreshCents
+	if r.profile != nil {
+		switch r.profile.Name {
+		case "apify":
+			return apifyLowRefreshCents
+		case "exa":
+			return exaLowRefreshMicro
+		}
 	}
 	return lowRefreshThreshold
 }

@@ -155,7 +155,42 @@ func fetchUsageFor(p *Profile, client *http.Client, key string, log *logger) usa
 	if p.Name == "apify" {
 		return fetchApifyUsage(client, p, key, log)
 	}
+	// Exa has NO balance endpoint (probed /billing /usage /account /credits
+	// /me /key on api.exa.ai -> all 404; admin-api.exa.ai needs a separate
+	// service key and reports spend, not remaining). Never query for one:
+	// without this guard the fallthrough below would GET
+	// api.exa.ai/v2/team/credit-usage, 404 forever, and leave every key
+	// "unmeasured" while warmupLoop retries once a minute.
+	if p.Name == "exa" {
+		return usage{}
+	}
 	return fetchUsage(client, p.Upstream, key, log)
+}
+
+// extractExaCostMicro reads an Exa response's costDollars.total (USD, e.g.
+// 0.007) and returns it in microUSD (7000). Returns -1 when absent or
+// unparseable so the caller can decide what to do.
+//
+// costDollars is an OBJECT, not a number:
+//
+//	"costDollars": {"total": 0.007, "search": {"neural": 0.007}}
+//
+// so it must be read as costDollars.total. A whole-response unmarshal into an
+// int64 would silently yield 0 and the balance would never move.
+func extractExaCostMicro(body []byte) int64 {
+	var env struct {
+		CostDollars *struct {
+			Total *float64 `json:"total"`
+		} `json:"costDollars"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil || env.CostDollars == nil || env.CostDollars.Total == nil {
+		return -1
+	}
+	micro := int64(math.Round(*env.CostDollars.Total * 1_000_000))
+	if micro < 0 {
+		return -1
+	}
+	return micro
 }
 
 // fetchApifyUsage reads a token's balance from GET {upstream}/v2/users/me/limits
@@ -368,15 +403,27 @@ func refreshKey(p *Profile, client *http.Client, index int, key string, log *log
 	return u.remaining
 }
 
+// hasPeriodEnd reports whether the profile's usage endpoint can return a real
+// billing-period end, so disableUntilReset should query it. Tavily and Exa
+// cannot (Tavily's /usage returns no period end; Exa has no balance endpoint at
+// all), so they always use the CREDIT_RESET_DAY fallback.
+func hasPeriodEnd(name string) bool {
+	switch name {
+	case "tavily", "exa":
+		return false
+	}
+	return true
+}
+
 // disableUntilReset disables key index in the profile's pool. Firecrawl keys
 // reset at their real billing-period end when available, and Apify keys at
-// their real monthlyUsageCycle.endAt; Tavily exposes no period end, so it
-// always uses the CREDIT_RESET_DAY fallback (as does any profile whose usage
-// fetch fails to return a period end).
+// their real monthlyUsageCycle.endAt; Tavily and Exa expose no period end, so
+// they always use the CREDIT_RESET_DAY fallback (as does any profile whose
+// usage fetch fails to return a period end).
 func disableUntilReset(p *Profile, client *http.Client, index int, key string, now time.Time, log *logger) {
 	fallback := fallbackReset(now, p.CreditResetDay)
 	reset := fallback
-	if p.Name != "tavily" {
+	if hasPeriodEnd(p.Name) {
 		u := fetchUsageFor(p, client, key, log)
 		if u.ok && u.hasEnd && !u.periodEnd.Before(now) && !u.periodEnd.After(now.AddDate(1, 0, 0)) {
 			reset = u.periodEnd

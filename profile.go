@@ -23,6 +23,12 @@ type Profile struct {
 	// AuthQueryParam authenticates by setting this query parameter to the key
 	// instead of an Authorization header (apify: "token").
 	AuthQueryParam string
+	// AuthHeader names the header that carries the key. When set, the key is
+	// sent in this header verbatim (exa: "x-api-key"). Empty = legacy
+	// "Authorization: Bearer <key>", which every other profile uses, so adding
+	// this field cannot regress them. Precedence in tryKey:
+	// AuthHeader > AuthQueryParam > Bearer.
+	AuthHeader string
 	// UpstreamTimeout, when > 0, gives this profile its own HTTP client with
 	// this timeout (apify sync actor runs take 30-120s, beyond the shared 30s).
 	UpstreamTimeout time.Duration
@@ -87,6 +93,35 @@ func buildProfiles(cfg Config) []*Profile {
 		})
 	}
 
+	if len(cfg.Exa.APIKeys) > 0 {
+		exPool := NewKeyPool(cfg.Exa.APIKeys)
+		// Exa balances are ACCOUNTED in microUSD (Exa exposes no balance
+		// endpoint), so thresholds are microUSD too.
+		exPool.SetThresholds(cfg.Exa.LowMicro, cfg.Exa.StopMicro)
+		host := cfg.Exa.Upstream
+		if i := strings.Index(host, "://"); i >= 0 {
+			host = host[i+3:]
+		}
+		// Seed every key at the full budget. This is what makes
+		// EnsureMeasured a no-op from the first request, so the refresher
+		// never issues a balance fetch (which would 404 - Exa has no such
+		// endpoint - and would leave keys "unmeasured" forever, retried every
+		// minute by warmupLoop).
+		for i := range cfg.Exa.APIKeys {
+			exPool.SetCredits(i, cfg.Exa.BudgetMicro)
+		}
+		profiles = append(profiles, &Profile{
+			Name:           "exa",
+			RoutePrefix:    cfg.Exa.RoutePrefix,
+			Upstream:       cfg.Exa.Upstream,
+			UpstreamHost:   host,
+			CreditResetDay: cfg.CreditResetDay,
+			RewriteNext:    false, // Exa search returns no "next" and embeds no upstream URLs
+			AuthHeader:     "x-api-key",
+			pool:           exPool,
+		})
+	}
+
 	if len(cfg.Apify.APIKeys) > 0 {
 		apPool := NewKeyPool(cfg.Apify.APIKeys)
 		// Apify credits are tracked in CENTS so sub-dollar stop thresholds are exact.
@@ -139,6 +174,16 @@ func (p *Profile) shouldRotate(status int, body []byte) (bool, string) {
 		}
 		return false, ""
 	}
+	if p.Name == "exa" {
+		// Status-only, like tavily/apify. Exa codes are unambiguous: 401 bad
+		// key, 402 credits exhausted, 429 rate limit. The body is never
+		// scanned - search results contain arbitrary scraped page text.
+		switch status {
+		case 401, 402, 429:
+			return true, "status " + strconv.Itoa(status)
+		}
+		return false, ""
+	}
 	// firecrawl (default)
 	switch status {
 	case 402, 429, 401:
@@ -165,6 +210,12 @@ func (p *Profile) isCreditExhausted(status int, body []byte) bool {
 		return status == 432 || status == 433
 	}
 	if p.Name == "apify" {
+		return status == 402
+	}
+	// Exa: 402 means the account's credits are gone (NO_MORE_CREDITS /
+	// API_KEY_BUDGET_EXCEEDED / TEAM_BUDGET_EXCEEDED). Exa uses the x402
+	// payment protocol, so this is a real 402, not a 200-with-error-body.
+	if p.Name == "exa" {
 		return status == 402
 	}
 	if status == 402 {

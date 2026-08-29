@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `api-key-rotator` is a Go reverse proxy that provides key rotation for
-multiple API providers, currently **Firecrawl**, **Tavily**, and **Apify**.
+multiple API providers, currently **Firecrawl**, **Tavily**, **Apify**, and **Exa**.
 Each provider is a "profile" with its own key pool, upstream base URL, route
 prefix, and rotation policy.
 
@@ -14,6 +14,12 @@ prefix, and rotation policy.
   pagination URLs are rewritten so pagination stays under rotation.
 - **Tavily**: requests with `/tavily` prefix are routed to `api.tavily.com`
   (prefix stripped). Rotation is purely status-code-driven (no body denylist).
+- **Exa**: requests with `/exa` prefix are routed to `api.exa.ai` (prefix
+  stripped). Auth is the **`x-api-key` header** (not `Authorization: Bearer`).
+  Rotation is status-code-only: 401/429 rotate, 402 disables, 403 stays
+  transient. **Exa exposes no balance endpoint**, so balances are *accounted*:
+  each key starts at `EXA_BUDGET_USD` (default $10, the free tier) and is
+  decremented by every response's `costDollars.total`, tracked in **micro-USD**.
 - **Apify**: requests with `/v2/acts` prefix are routed to `api.apify.com`
   with the prefix **kept** (the real API lives under `/v2/acts`). Auth is the
   `?token=` **query param** (rotator replaces/adds it per attempt, drops any
@@ -88,7 +94,7 @@ Key files and their roles:
 | `main.go` | `buildServer` wires `Config` -> `[]Profile` -> transports -> clients (per-profile client when `UpstreamTimeout` > 0, e.g. apify's 180s) -> `Refresher` per profile -> `rotator`. Routes `/healthz`, `/status`, `/`. `--healthcheck` flag. Starts goroutines: `RefreshAll` warm-up, `resetLoop`, `dailyRefreshLoop`. |
 | `config.go` | `LoadConfig` parses all env vars; `buildProfiles` constructs Firecrawl + (optional) Tavily/Apify profiles. Validates thresholds (stop <= low). |
 | `keys.go` | `KeyPool` - per-key `stats`, `disabled`/`disabledUntil`, `remainingCredits` (MaxInt64 = unmeasured), `cooldownUntil`. `Current`/`currentLocked` pick highest-credit usable key, skipping cooled-down keys (fallback to them if all cooled). `Advance` cools the current key ~30s so equal-credit keys actually rotate. `Decrement`/`SetCredits` adjust predicted/real balances. `AnyUsable` checks >= stop threshold. `Snapshot` masks keys + reports `remainingCredits` (-1 = unmeasured). |
-| `profile.go` | `Profile` struct (pool, upstream, route prefix, `KeepPrefix`, `AuthQueryParam`, `UpstreamTimeout`, rotation policy funcs). `matchProfile` routes requests (strips prefix unless `KeepPrefix`). |
+| `profile.go` | `Profile` struct (pool, upstream, route prefix, `KeepPrefix`, `AuthHeader`/`AuthQueryParam`, `UpstreamTimeout`, rotation policy funcs). `matchProfile` routes requests (strips prefix unless `KeepPrefix`). |
 | `proxy.go` | The rotator: profile routing, rotation loop + `tryKey` (backoff retries on transient), header copying, body cap, disable-on-credit-exhaustion, credit decrement on success, rewrite+guard, 503 when no usable key. `backoffSchedule`, `extractCreditsUsed`, `readCapped`, `writeRawResponse`, `isHopByHop`. |
 | `rotate.go` | `shouldRotate` / `shouldRetry` / `isCreditExhausted` — now profile-aware wrappers that dispatch to Firecrawl-specific or Tavily-specific logic. |
 | `refresh.go` | `Refresher` per profile: `OnSwitch`, `MaybeRefreshLow`, `DailyRefresh`, `RefreshAll`. All refreshes run in background goroutines. |
@@ -113,6 +119,8 @@ Key files and their roles:
 - **`next`-URL rewriting is intentionally narrow.** Only `"next"` keys with absolute URLs on the upstream host are rewritten. Never broaden this - scraped content can legitimately contain the upstream host.
 - **Rotation only refreshes a key's balance when the rotation reason could have changed it.** `OnSwitchReason` (not `OnSwitch`) is called from the rotation loop, and it skips the `/usage` fetch unless the status was a credit/limit rejection (402/432/433). A 429/401/403/network error proves the request was refused *before* it was billed, so the cached balance is still accurate. This matters because Tavily rate-limits `/usage` to **10 requests per 10 minutes**, far tighter than `/search`: in the 2026-08-28 incident 32 rotations x 2 keys = 64 usage calls blew that budget, and the resulting `usage fetch failed reason=status:429` warnings looked like a second bug but were collateral. The key rotated *onto* is not refreshed here either - its first-ever measurement is already handled synchronously by `EnsureMeasured` on the request path, so skipping it cannot leave a key at "unmeasured = plenty".
 - **`Retry-After` lengthens the rotation cooldown instead of sleeping on the request path.** Tavily sends `retry-after: 60` on 429s. Because each Tavily key is its own account (verified: using one key does not move another key's `plan_usage`), rotating to the next key is the correct response - so `AdvanceAfter` cools the rejected key for `max(rotateCooldown, retry-after)` rather than blocking the caller. Cooldown is only a deprioritization (`currentLocked` tier 3 still returns a key), so a long `Retry-After` can never cause a 503. Absent/short header = legacy ~30s, so firecrawl and every non-429 rotation are unaffected.
+- **Exa balances are accounted in MICRO-USD, and cents would silently break them.** A search costs $0.007, and `int(0.007 * 100) == 0` — so a cents-denominated balance would **never decrement**, leaving every key pinned at a full budget that never auto-stops. Micro-USD keeps $0.007 exact (7000) and still fits int64 ($10 = 10_000_000). The env vars (`EXA_BUDGET_USD` etc.) stay in USD; convert at the boundary. Related: `Decrement` coerces `cost <= 0` to 1, which is the intended "1 credit" estimate for firecrawl/tavily but meaningless as 1 micro-USD, so exa skips the decrement when the response reports no cost (`costOf` returns 0 for it).
+- **A profile with no balance endpoint must be guarded in `fetchUsageFor`, not just left to fall through.** `fetchUsageFor` dispatches on `p.Name` and defaults to the **Firecrawl** endpoint, so an unrecognized profile name silently GETs `{upstream}/v2/team/credit-usage`. For exa that 404s forever while `warmupLoop` retries every minute waiting for "unmeasured == 0", which never arrives. Two guards: an explicit `exa` branch returning `usage{}`, **and** seeding every key's balance in `buildProfiles` so `EnsureMeasured` is a no-op from the first request. `hasPeriodEnd` likewise excludes exa (and tavily) from the disable-time usage query.
 - **`proxyBase` is derived from `req.Host`** when `PROXY_BASE_URL` is unset.
 - **Body cap (`MAX_BODY_BYTES`) is a hard boundary.** Above it, forwarded untouched, no rotate/rewrite. `0` = no cap.
 - **No external dependencies.** Stdlib only. Keep it that way.

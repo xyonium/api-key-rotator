@@ -150,7 +150,15 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		switch res.kind {
 		case resOK:
 			p.pool.RecordSuccess(res.idx)
-			p.pool.Decrement(res.idx, extractCreditsUsed(res.body))
+			// Decrement coerces cost <= 0 to 1, which is the intended
+			// "1 credit" estimate for firecrawl/tavily when the response
+			// reports no creditsUsed. Exa is the exception: 1 MICRO-USD is
+			// $0.000001, a meaningless under-estimate that would still drift
+			// the balance, so exa skips the decrement when it has no cost to
+			// report (costOf returns 0 for it).
+			if cost := costOf(p, res.body); cost > 0 || (p != nil && p.Name != "exa") {
+				p.pool.Decrement(res.idx, cost)
+			}
 			if p.refresh != nil {
 				p.refresh.MaybeRefreshLow(res.idx)
 			}
@@ -254,7 +262,12 @@ func (r *rotator) tryKey(req *http.Request, p *Profile, idx int, key string, inB
 		copyHeaders(upReq.Header, req.Header)
 		upReq.Header.Del("Authorization")
 		upReq.Header.Del("Host")
-		if p.AuthQueryParam != "" {
+		if p.AuthHeader != "" {
+			// Header auth with a provider-specific name (exa: "x-api-key").
+			// The key is the bare value - no "Bearer " prefix - and it
+			// replaces any client-supplied value, so rotation just works.
+			upReq.Header.Set(p.AuthHeader, key)
+		} else if p.AuthQueryParam != "" {
 			// Query-param auth (apify): the key rides in the URL, not a header.
 			// Set replaces any client-supplied value, so rotation just works.
 			q := upReq.URL.Query()
@@ -330,6 +343,26 @@ func (r *rotator) sleepOrCancel(req *http.Request, d time.Duration) bool {
 	case <-req.Context().Done():
 		return true
 	}
+}
+
+// costOf reports how much of a key's balance one successful response consumed,
+// in that profile's own unit, so the pool can decrement its predicted balance.
+//
+// exa: costDollars.total -> microUSD. Exa has no balance endpoint, so this is
+// the only signal; a search costs $0.007 = 7000 microUSD. When the field is
+// missing we return 0 rather than the 1 the other profiles fall back to,
+// because 1 microUSD ($0.000001) is not a meaningful guess.
+//
+// everyone else: Firecrawl's creditsUsed, whose caller turns -1 into a 1-credit
+// estimate (Decrement treats cost <= 0 as 1).
+func costOf(p *Profile, body []byte) int64 {
+	if p != nil && p.Name == "exa" {
+		if micro := extractExaCostMicro(body); micro > 0 {
+			return micro
+		}
+		return 0
+	}
+	return extractCreditsUsed(body)
 }
 
 // extractCreditsUsed reads a Firecrawl response's top-level creditsUsed field

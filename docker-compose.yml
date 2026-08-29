@@ -21,6 +21,12 @@ services:
       # TAVILY_API_KEYS: "tvly-key1,tvly-key2"     # optional tavily profile
       # TAVILY_UPSTREAM: "https://api.tavily.com"
       # TAVILY_ROUTE_PREFIX: "/tavily"
+      # EXA_API_KEYS: "exa-key1,exa-key2"         # optional exa profile
+      # EXA_UPSTREAM: "https://api.exa.ai"
+      # EXA_ROUTE_PREFIX: "/exa"                   # stripped before forwarding
+      # EXA_BUDGET_USD: "10.00"                    # per-key monthly budget (free tier)
+      # EXA_LOW_CREDIT_USD: "0.50"                 # rotate off a key below this
+      # EXA_STOP_CREDIT_USD: "0.10"                # 503 when every key is below this
       # APIFY_API_KEYS: "apify-token1,apify-token2" # optional apify profile
       # APIFY_UPSTREAM: "https://api.apify.com"     # point at your own fake/stub for testing
       # APIFY_ROUTE_PREFIX: "/v2/acts"              # kept in forwarded path
