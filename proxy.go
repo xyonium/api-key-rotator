@@ -137,7 +137,7 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				if req.Context().Err() != nil {
 					return // client went away; don't write
 				}
-				r.log.warn("all keys busy, queue timeout", "profile", p.Name)
+				r.log.warn("all keys busy, queue timeout", "profile", p.Name, "keys", p.pool.Snapshot().Keys)
 				http.Error(w, `{"success":false,"error":"all keys busy, queue timeout","profile":"`+p.Name+`"}`, http.StatusServiceUnavailable)
 				return
 			}
@@ -162,9 +162,9 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		case resNetErr:
 			r.log.warn("transient errors exhausted on key, rotating", "profile", p.Name, "key", res.idx)
 			prev := res.idx
-			p.pool.Advance()
+			p.pool.AdvanceAfter(res.header)
 			if next, _ := p.pool.Current(); next >= 0 && p.refresh != nil {
-				p.refresh.OnSwitch(prev, next)
+				p.refresh.OnSwitchReason(prev, next, res.status)
 			}
 			continue
 		case resRotate:
@@ -177,9 +177,9 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				r.log.warn("key credit-disabled until reset", "profile", p.Name, "key", res.idx, "masked", maskKey(res.key))
 			}
 			prev := res.idx
-			p.pool.Advance()
+			p.pool.AdvanceAfter(res.header)
 			if next, _ := p.pool.Current(); next >= 0 && next != prev && p.refresh != nil {
-				p.refresh.OnSwitch(prev, next)
+				p.refresh.OnSwitchReason(prev, next, res.status)
 			}
 			continue
 		case resExhausted:
@@ -192,7 +192,7 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if !cleanBreak {
-		r.log.warn("all keys exhausted", "profile", p.Name, "lastStatus", lastStatus, "keys", len(p.pool.keys), "maxPasses", r.cfg.MaxPasses)
+		r.log.warn("all keys exhausted", "profile", p.Name, "lastStatus", lastStatus, "keys", p.pool.Snapshot().Keys, "maxPasses", r.cfg.MaxPasses)
 	}
 
 	if overCap {

@@ -180,3 +180,53 @@ func (r *Refresher) refreshOne(idx int) {
 		r.mu.Unlock()
 	}
 }
+
+// OnSwitchReason is OnSwitch plus the status that caused the rotation.
+//
+// The key we rotated OFF (fromIdx) is only refreshed when the rotation reason
+// could actually have changed its balance: a credit/limit rejection (402, 432,
+// 433). A 429, 401, 403-that-exhausted-backoff or a network error proves
+// nothing about the balance -- the request was refused before it was billed --
+// so refreshing it just spends a /usage call.
+//
+// The key we rotated ONTO (toIdx) is NOT refreshed here either, for the same
+// reason: every reason that reaches this call other than a credit/limit
+// rejection left its balance untouched. Its first-ever measurement is already
+// handled synchronously on the request path by EnsureMeasured (proxy.go), so
+// skipping it here cannot leave a key "unmeasured = plenty".
+//
+// This matters because Tavily rate-limits /usage to 10 requests per 10 MINUTES,
+// far tighter than /search: a 403/429 storm that rotates 8 times per client
+// request blew the usage budget on its own (32 rotations -> 64 fetches in the
+// 2026-08-28 incident), which then showed up as the spurious
+// "usage fetch failed reason=status:429" warnings at the end of each burst.
+func (r *Refresher) OnSwitchReason(fromIdx, toIdx, status int) {
+	if r == nil {
+		return
+	}
+	if !balanceMayHaveChanged(status) {
+		return
+	}
+	go func() {
+		if fromIdx >= 0 && fromIdx < len(r.keys) {
+			r.refreshOne(fromIdx)
+		}
+		if toIdx >= 0 && toIdx < len(r.keys) && toIdx != fromIdx {
+			r.refreshOne(toIdx)
+		}
+	}()
+}
+
+// balanceMayHaveChanged reports whether a rotation caused by this status could
+// have moved the key's balance, making a /usage re-fetch worth its cost.
+// Credit/limit rejections mean the account is at or past a cap, so the real
+// balance is unknown and worth reading. Everything else (rate limits, auth
+// failures, edge blocks like a 403, network errors, 5xx) means the request was
+// refused before being billed, so the last known balance is still accurate.
+func balanceMayHaveChanged(status int) bool {
+	switch status {
+	case 402, 432, 433:
+		return true
+	}
+	return false
+}

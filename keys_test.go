@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"testing"
 	"time"
 )
@@ -229,4 +230,105 @@ func TestKeyPool_SnapshotShowsCredits(t *testing.T) {
 func (p *KeyPool) snapshotCredits(index int) int64 {
 	snap := p.Snapshot()
 	return snap.Keys[index].RemainingCredits
+}
+
+func TestRetryAfterSeconds(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"60", 60},
+		{"1", 1},
+		{"", 0},
+		{"abc", 0},
+		{"-5", 0},
+		{"99999", 3600}, // capped: never strand a key indefinitely
+	}
+	for _, tc := range cases {
+		h := http.Header{}
+		if tc.in != "" {
+			h.Set("Retry-After", tc.in)
+		}
+		if got := retryAfterSeconds(h); got != tc.want {
+			t.Errorf("retryAfterSeconds(%q) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Since Tavily keys are separate accounts, rotating IS the correct response to
+// a 429 -- but the rejected key must stay deprioritized for as long as upstream
+// asked, instead of coming straight back after the plain 30s cooldown and
+// burning another request against a limit that is still in force.
+func TestKeyPool_AdvanceAfterRetryAfterHonorsHeader(t *testing.T) {
+	pool := NewKeyPool([]string{"tv-a", "tv-b"})
+	pool.SetThresholds(10, 2)
+	pool.SetCredits(0, 500)
+	pool.SetCredits(1, 400)
+
+	h := http.Header{}
+	h.Set("Retry-After", "120")
+	pool.AdvanceAfter(h)
+
+	pool.mu.Lock()
+	got := pool.cooldownUntil[0]
+	pool.mu.Unlock()
+	if d := time.Until(got); d < 110*time.Second || d > 121*time.Second {
+		t.Fatalf("cooldown after retry-after:120 = %v, want ~120s", d)
+	}
+}
+
+// Without Retry-After the behavior must be byte-for-byte the legacy Advance:
+// plain 30s cooldown, so firecrawl (which does not send the header) and every
+// non-429 rotation are unaffected by this change.
+func TestKeyPool_AdvanceAfterNoHeaderIsLegacy(t *testing.T) {
+	pool := NewKeyPool([]string{"tv-a", "tv-b"})
+	pool.SetThresholds(10, 2)
+	pool.SetCredits(0, 500)
+	pool.SetCredits(1, 400)
+
+	pool.AdvanceAfter(nil)
+
+	pool.mu.Lock()
+	got := pool.cooldownUntil[0]
+	pool.mu.Unlock()
+	if d := time.Until(got); d < 29*time.Second || d > 31*time.Second {
+		t.Fatalf("cooldown with no header = %v, want ~30s (legacy)", d)
+	}
+}
+
+// A shorter Retry-After must not shorten the built-in cooldown: rotateCooldown
+// is a FLOOR, not a ceiling.
+func TestKeyPool_AdvanceAfterShortHeaderKeepsFloor(t *testing.T) {
+	pool := NewKeyPool([]string{"tv-a", "tv-b"})
+	pool.SetThresholds(10, 2)
+	pool.SetCredits(0, 500)
+	pool.SetCredits(1, 400)
+
+	h := http.Header{}
+	h.Set("Retry-After", "5")
+	pool.AdvanceAfter(h)
+
+	pool.mu.Lock()
+	got := pool.cooldownUntil[0]
+	pool.mu.Unlock()
+	if d := time.Until(got); d < 29*time.Second || d > 31*time.Second {
+		t.Fatalf("cooldown after retry-after:5 = %v, want ~30s (floor)", d)
+	}
+}
+
+// Cooldown is only a DEPRIORITIZATION: when every key is cooling down the pool
+// must still return a key (tier-3 fallback), so honoring Retry-After can never
+// turn a working pool into a 503.
+func TestKeyPool_AdvanceAfterNeverCauses503(t *testing.T) {
+	pool := NewKeyPool([]string{"tv-a"})
+	pool.SetThresholds(10, 2)
+	pool.SetCredits(0, 500)
+
+	h := http.Header{}
+	h.Set("Retry-After", "600")
+	pool.AdvanceAfter(h)
+
+	if i, _ := pool.Current(); i < 0 {
+		t.Fatal("Current() = -1 after a long retry-after cooldown: must still serve (cooldown is only deprioritization)")
+	}
 }

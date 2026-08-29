@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"math"
+	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -261,6 +264,60 @@ func (p *KeyPool) Advance() (int, string) {
 		p.cooldownUntil[p.cursor] = time.Now().Add(rotateCooldown)
 	}
 	return p.currentLocked()
+}
+
+// AdvanceAfter is Advance, but a response that carries Retry-After cools the
+// key down for as long as upstream asked (when that is longer than
+// rotateCooldown). Tavily sends "retry-after: 60" on its 429s, and since each
+// key is its own account, rotating to the next key IS the right response --
+// but the rejected key would otherwise come straight back after 30s and burn
+// another request against a limit that is still in force.
+//
+// The header is honored whatever the status: no supported provider sends it
+// outside a throttling response, and keying off the status would only add a
+// branch that has to be kept in sync with each provider's behavior.
+//
+// The cooldown is only a DEPRIORITIZATION: currentLocked's tier-3 fallback
+// still returns a key when every key is cooling down, so a long Retry-After
+// can never turn a working pool into a 503. rotateCooldown remains a FLOOR, so
+// a short (or absent) Retry-After leaves legacy behavior untouched.
+func (p *KeyPool) AdvanceAfter(header http.Header) (int, string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cursor >= 0 && p.cursor < len(p.cooldownUntil) {
+		d := rotateCooldown
+		if s := retryAfterSeconds(header); s > 0 {
+			if want := time.Duration(s) * time.Second; want > d {
+				d = want
+			}
+		}
+		p.cooldownUntil[p.cursor] = time.Now().Add(d)
+	}
+	return p.currentLocked()
+}
+
+// retryAfterSeconds reads a Retry-After header in delta-seconds form (the only
+// form Tavily sends, e.g. "retry-after: 60"). HTTP-date form is ignored: no
+// supported provider sends it, and parsing it would add a timezone dependency
+// for no benefit. Returns 0 when the header is absent, non-numeric, or not
+// positive -- callers then fall back to the built-in cooldown.
+func retryAfterSeconds(h http.Header) int {
+	if h == nil {
+		return 0
+	}
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	// Guard against an absurd value stranding a key: cap at 1 hour.
+	if n > 3600 {
+		n = 3600
+	}
+	return n
 }
 
 func (p *KeyPool) RecordSuccess(index int) {

@@ -280,3 +280,70 @@ func TestRotator_TavilyDisableUsesFallbackReset(t *testing.T) {
 		t.Fatalf("DisabledUntil = %v is in the past", k.DisabledUntil)
 	}
 }
+
+// TestRotator_Tavily403RetryBudgetIsCapped is an app-level regression test for
+// the 2026-08-28 403 storm. It deliberately goes through LoadConfig +
+// buildProfiles (unlike the other tests here, which hand-build a Profile) so it
+// catches the actual defect: the tavily profile never set Max403Retries, so
+// tryKey's 403 budget guard -- added for firecrawl in 726e487 -- silently did
+// not apply and tavily fell back to the full 6-request legacy backoff per key.
+//
+// Effect: 4 keys x 6 hits x MaxPasses 2 = ~48 upstream requests per client
+// request, from one egress IP. That is what got the IP blocked by Tavily's AWS
+// edge (403s with a bare awselb/2.0 HTML body), and it made a failing request
+// take ~106s to return 403, by which time the caller had usually timed out.
+func TestRotator_Tavily403RetryBudgetIsCapped(t *testing.T) {
+	orig := backoffSchedule
+	backoffSchedule = []time.Duration{1 * time.Millisecond, 1 * time.Millisecond, 1 * time.Millisecond, 1 * time.Millisecond, 1 * time.Millisecond}
+	defer func() { backoffSchedule = orig }()
+
+	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
+	t.Setenv("TAVILY_API_KEYS", "tv-a,tv-b")
+	t.Setenv("UPSTREAM", "http://firecrawl.invalid")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	profiles := buildProfiles(cfg)
+	var tv *Profile
+	for _, p := range profiles {
+		if p.Name == "tavily" {
+			tv = p
+		}
+	}
+	if tv == nil {
+		t.Fatal("tavily profile not built")
+	}
+	if tv.Max403Retries <= 0 {
+		t.Fatalf("tavily Max403Retries = %d, want > 0 (uncapped 403 retries caused the storm)", tv.Max403Retries)
+	}
+
+	// Verify the budget actually caps upstream hits end-to-end.
+	var hits int32
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(403)
+	}))
+	defer fake.Close()
+
+	tv.Upstream = fake.URL
+	tv.UpstreamHost = strings.TrimPrefix(fake.URL, "http://")
+	tv.pool.SetCredits(0, 1000)
+	tv.pool.SetCredits(1, 1000)
+	r := newRotator(cfg, []*Profile{tv}, fake.Client(), newLogger("error"))
+
+	req := httptest.NewRequest(http.MethodPost, "/tavily/search", strings.NewReader(`{"query":"x"}`))
+	req.Host = "rotator.test"
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	got := atomic.LoadInt32(&hits)
+	want := int32(2 * (tv.Max403Retries + 1) * cfg.MaxPasses) // 2 keys x hits/key x passes
+	if got != want {
+		t.Fatalf("upstream hits = %d, want %d (Max403Retries=%d, keys=2, maxPasses=%d)", got, want, tv.Max403Retries, cfg.MaxPasses)
+	}
+	if got > 8 {
+		t.Fatalf("upstream hits = %d, want <= 8: the 403 budget is not capping the storm", got)
+	}
+}

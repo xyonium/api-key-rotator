@@ -44,6 +44,12 @@ type TavilyConfig struct {
 	RoutePrefix string
 	LowCredit   int64
 	StopCredit  int64
+	// Retries403 caps same-key retries on a 403 before rotating. Tavily's 403
+	// comes from its AWS edge (server: awselb/2.0, bare HTML body) - it is an
+	// IP-level block, not a key problem, so hammering it 6x per key across all
+	// keys turns one client request into ~48 upstream hits and deepens the
+	// block. Defaults to the firecrawl 403 budget.
+	Retries403 int
 }
 
 // ApifyConfig holds the Apify profile's settings. The profile is disabled
@@ -185,7 +191,17 @@ func LoadConfig() (Config, error) {
 		}
 	}
 
-	tavily, err := loadTavilyConfig(lowCredit, stopCredit)
+	// Parsed before the profiles are built: firecrawl and tavily share this
+	// budget (both hit edge-level 403s that are not key problems).
+	retries403, err := envInt("FIRECRAWL_403_RETRIES", 1)
+	if err != nil {
+		return Config{}, err
+	}
+	if retries403 < 0 {
+		return Config{}, fmt.Errorf("FIRECRAWL_403_RETRIES must be >= 0, got %d", retries403)
+	}
+
+	tavily, err := loadTavilyConfig(lowCredit, stopCredit, retries403)
 	if err != nil {
 		return Config{}, err
 	}
@@ -212,13 +228,6 @@ func LoadConfig() (Config, error) {
 	}
 	if queueMs < 0 {
 		return Config{}, fmt.Errorf("FIRECRAWL_CONCURRENCY_QUEUE_MS must be >= 0, got %d", queueMs)
-	}
-	retries403, err := envInt("FIRECRAWL_403_RETRIES", 1)
-	if err != nil {
-		return Config{}, err
-	}
-	if retries403 < 0 {
-		return Config{}, fmt.Errorf("FIRECRAWL_403_RETRIES must be >= 0, got %d", retries403)
 	}
 
 	return Config{
@@ -248,7 +257,7 @@ func LoadConfig() (Config, error) {
 // loadTavilyConfig parses the TAVILY_* env vars. Tavily thresholds default to
 // the shared LOW/STOP values. The route prefix must start with '/', must not
 // end with '/', and must not shadow the reserved /healthz or /status paths.
-func loadTavilyConfig(sharedLow, sharedStop int64) (TavilyConfig, error) {
+func loadTavilyConfig(sharedLow, sharedStop int64, retries403 int) (TavilyConfig, error) {
 	t := TavilyConfig{
 		APIKeys:     parseKeys(os.Getenv("TAVILY_API_KEYS")),
 		RoutePrefix: envStr("TAVILY_ROUTE_PREFIX", "/tavily"),
@@ -287,6 +296,7 @@ func loadTavilyConfig(sharedLow, sharedStop int64) (TavilyConfig, error) {
 	if t.StopCredit > t.LowCredit {
 		return TavilyConfig{}, fmt.Errorf("TAVILY_STOP_CREDIT_THRESHOLD (%d) must be <= TAVILY_LOW_CREDIT_THRESHOLD (%d)", t.StopCredit, t.LowCredit)
 	}
+	t.Retries403 = retries403
 	return t, nil
 }
 

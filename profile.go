@@ -78,7 +78,12 @@ func buildProfiles(cfg Config) []*Profile {
 			UpstreamHost:   host,
 			CreditResetDay: cfg.CreditResetDay,
 			RewriteNext:    false,
-			pool:           tvPool,
+			// Tavily's 403 is an AWS-edge block of the egress IP (bare HTML from
+			// awselb/2.0), not a key rejection. Without this budget the full
+			// 6-request legacy backoff fires per key, so one client request
+			// becomes ~48 upstream hits and deepens the block.
+			Max403Retries: cfg.Tavily.Retries403,
+			pool:          tvPool,
 		})
 	}
 

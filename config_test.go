@@ -39,6 +39,10 @@ func TestLoadConfig_defaults(t *testing.T) {
 			RoutePrefix: "/tavily",
 			LowCredit:   10,
 			StopCredit:  2,
+			// Shares FIRECRAWL_403_RETRIES' default of 1: tavily's 403 is an
+			// AWS-edge block, and the uncapped 6-request legacy backoff per key
+			// is what turned one client request into ~48 upstream hits.
+			Retries403: 1,
 		},
 		Apify: ApifyConfig{
 			APIKeys:        nil,

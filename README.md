@@ -57,7 +57,7 @@ firecrawl:                     # your existing mcpo + firecrawl-mcp service
 | `FIRECRAWL_MAX_CONCURRENT_PER_KEY` | `1` | Max in-flight requests on a single Firecrawl key. Free keys are ~2 concurrent browsers, so a sub-agent burst on one key would otherwise trigger 429 "concurrency limit reached". `0` = unlimited. See "Concurrency control" below. |
 | `FIRECRAWL_CONCURRENCY_SATURATION` | `queue` | What to do when every Firecrawl key is at its concurrency cap: `queue` (wait for a slot) or `reject` (return 429 immediately). |
 | `FIRECRAWL_CONCURRENCY_QUEUE_MS` | `15000` | How long a queued request waits for a free slot before returning 503. Capped per request, canceled if the client disconnects. |
-| `FIRECRAWL_403_RETRIES` | `1` | Same-key retries on a 403 before rotating. Firecrawl documents 403 as non-retryable (permission/edge block), so the default caps it at 1 retry (2 hits/key) instead of the legacy 5. `0` = legacy full backoff. |
+| `FIRECRAWL_403_RETRIES` | `1` | Same-key retries on a 403 before rotating, for the Firecrawl **and Tavily** profiles. Firecrawl documents 403 as non-retryable (permission/edge block), and Tavily's 403 is likewise an AWS-edge block of the egress IP (bare `awselb/2.0` HTML body) rather than a key problem, so the default caps it at 1 retry (2 hits/key) instead of the legacy 5. `0` = legacy full backoff. |
 | `TAVILY_API_KEYS` | (unset) | Comma-separated Tavily key pool. When set, enables the Tavily profile. |
 | `TAVILY_UPSTREAM` | `https://api.tavily.com` | Upstream Tavily API base for the Tavily profile. |
 | `TAVILY_ROUTE_PREFIX` | `/tavily` | Route prefix that selects the Tavily profile. Stripped before forwarding. |
@@ -124,6 +124,7 @@ risks account flags. The rotator now **respects per-key concurrency**:
 - **403 retry is capped** (`FIRECRAWL_403_RETRIES`, default 1) because
   Firecrawl documents 403 as non-retryable (permission/edge block) - retrying
   it 5× per key was the main churn driver. It still never disables the key.
+  The same cap now applies to Tavily (see "Tavily profile" below).
 
 These apply to the Firecrawl profile only; Tavily and Apify are unchanged
 (their pools run unlimited, as before).
@@ -143,7 +144,9 @@ is tried, up to `MAX_PASSES` full sweeps.
 **5xx**, and network errors are retried on the same key with exponential backoff
 `500ms -> 1s -> 2s -> 4s -> 8s` (5 attempts, ~15s total) before rotating. A 403
 is usually a network/edge-layer issue, not a per-key problem, so it does NOT
-disable or rotate immediately.
+disable or rotate immediately. 403s are additionally capped by
+`FIRECRAWL_403_RETRIES` (default 1, so 2 hits per key) on the Firecrawl and
+Tavily profiles.
 
 A **successful** response (`status < 400` with `success:true`, or no `success`
 field) **never** rotates - even if the scraped *content* mentions "rate limit" or
@@ -190,6 +193,20 @@ Tavily. Requests whose path starts with `TAVILY_ROUTE_PREFIX` (default
 - **Body-based rejection detection**: Tavily rejects are detected purely by
   status code, never by scanning response body text. The Firecrawl denylist
   never applies to Tavily responses.
+- **403 retry is capped** (shares `FIRECRAWL_403_RETRIES`, default 1). Tavily's
+  403 comes from its AWS edge (`server: awselb/2.0`, bare HTML body) and blocks
+  the *egress IP*, not the key - so retrying it 6× per key across all keys
+  turned one client request into ~48 upstream hits, deepened the block, and made
+  a failing request take ~106s to return. With the cap, a failing request
+  returns in ~4s.
+- **`Retry-After` is honored as a cooldown.** Tavily returns
+  `retry-after: 60` on its 429s. Since each key is its own account, rotating to
+  the next key is the correct response - but the rejected key is then
+  deprioritized for as long as upstream asked, instead of coming straight back
+  after the usual ~30s cooldown. The cooldown is only a deprioritization: the
+  pool still serves from a cooling-down key when no other key is available, so a
+  long `Retry-After` can never cause a 503. Without the header (all other
+  providers), behavior is the legacy ~30s cooldown.
 - **Usage tracking**: the proxy calls `GET /usage` on the Tavily upstream
   (per-key) to read `key.usage` / `key.limit`,
   `account.plan_usage` / `plan_limit`,
