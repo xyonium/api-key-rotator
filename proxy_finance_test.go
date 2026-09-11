@@ -457,6 +457,72 @@ func TestMarketaux402IsExhausted401Rotates(t *testing.T) {
 	}
 }
 
+// TestFMP402RestrictedEndpointDoesNotRotate: when FMP returns 402 with the
+// plan-tier "Restricted Endpoint" body, other keys are also blocked (it's the
+// plan, not the key) - so the rotator should NOT burn the remaining keys by
+// retrying. Return false from shouldRotate and let the client see the 402.
+func TestFMP402RestrictedEndpointDoesNotRotate(t *testing.T) {
+	p := &Profile{Name: "fmp"}
+	restricted := []byte("Restricted Endpoint: This endpoint is not available under your current subscription")
+
+	if rot, _ := p.shouldRotate(402, restricted); rot {
+		t.Fatalf("FMP 402 + Restricted Endpoint must NOT rotate (plan-tier, not key)")
+	}
+	if p.isCreditExhausted(402, restricted) {
+		t.Fatalf("FMP 402 + Restricted Endpoint must NOT credit-disable (plan-tier, not key)")
+	}
+
+	// A different 402 (payment-required without the restricted-endpoint prefix,
+	// though FMP doesn't currently emit it) should still rotate so we learn the
+	// truth from the next key.
+	if rot, _ := p.shouldRotate(402, []byte(`{"Error Message":"Payment Required"}`)); !rot {
+		t.Fatalf("FMP 402 with non-Restricted body SHOULD rotate (could be key-specific)")
+	}
+}
+
+// TestFMP402RotationPoolIntact: end-to-end proof that when FMP returns
+// plan-blocked 402, NO key gets disabled or even cooled down. The client's
+// next request should hit the same first key again.
+func TestFMP402RotationPoolIntact(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(402)
+		_, _ = w.Write([]byte("Restricted Endpoint: This endpoint is not available under your current subscription"))
+	}))
+	defer upstream.Close()
+
+	cfg := financeCfg(upstream)
+	cfg.MaxPasses = 2
+	p := newFinanceProfile("fmp", "/fmp", []string{"k1", "k2", "k3"}, 250, 10, 1)
+	r, _ := withFinanceRotator(cfg, p)
+	for i := 0; i < 3; i++ {
+		p.pool.SetCredits(i, 250)
+	}
+	p.Upstream = upstream.URL
+	p.UpstreamHost = "127.0.0.1"
+
+	req := httptest.NewRequest(http.MethodGet, "/fmp/stable/news/stock?symbols=AAPL", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != 402 {
+		t.Fatalf("want 402 forward to client, got %d body=%s", w.Code, w.Body.String())
+	}
+	if got := p.pool.PredictedRemaining(0); got != 250 {
+		t.Fatalf("key0 should NOT decrement on plan-blocked 402 (was refused pre-quota), got %d", got)
+	}
+	// No key was disabled or cooled down: a fresh 402 request should serve from
+	// key 0 again, not rotate to key 1.
+	if idx, _ := p.pool.Current(); idx != 0 {
+		t.Fatalf("pool should still prefer key0 after restricted 402, Current=%d", idx)
+	}
+	snap := p.pool.Snapshot()
+	for i, k := range snap.Keys {
+		if k.Disabled {
+			t.Fatalf("key %d should NOT be disabled after a restricted-endpoint 402", i)
+		}
+	}
+}
+
 // TestFinanceHelpersShared sanity: prefix validation + stop<=low guards.
 func TestFinanceRoutePrefixGuards(t *testing.T) {
 	if err := checkRoutePrefix("FMP", "/fmp"); err != nil {

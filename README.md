@@ -356,8 +356,25 @@ never has to fire.
 | Auth query param | `apikey` | `apikey` | `api_token` |
 | Free tier | 250 req/day | 25 req/day | 100 req/day |
 | Daily-cap signal | `429` "Limit Reach" | **`200 OK` + body `{"Note":"..."}`/`{"Information":"..."}`** | `402` `usage_limit_reached` |
-| Rotate (transient) | `401` | `401` | `401`, `429` |
+| Rotate (transient) | `401`, `402`¹ | `401` | `401`, `402`, `429` |
 | Credit-exhausted (disables) | `429` | rate-limit `200` body | `402` |
+
+¹ **FMP `402` is special-cased.** FMP returns `402` for two very different
+reasons, and we use the body prefix to tell them apart:
+
+- **Plan-tier block** — body starts with `Restricted Endpoint: This endpoint
+  is not available under your current subscription`. The plan (not this key)
+  forbids the endpoint; rotating the other keys would burn their daily counter
+  on the same refusal. The rotator **does NOT rotate, does NOT disable, does
+  NOT decrement** — it forwards the `402` to the client so you can pick a
+  different (free-tier) endpoint. Free-tier endpoints: `/stable/profile`,
+  `/stable/quote`, `/stable/historical-price-eod/{light,full}`,
+  `/stable/income-statement`, `/stable/balance-sheet-statement`,
+  `/stable/cash-flow-statement`, `/stable/search-name`. Plan-blocked endpoints:
+  `/stable/news/stock`, `/stable/news/stock-latest`, `/fmp-articles`, and most
+  of the legacy `/api/v3/*` and `/api/v4/*` news/household endpoints.
+- **Key-tier quota/billing refusal** — any other `402` body (rare, not
+  currently observed) rotates like a `401`, so the next key can corroborate.
 
 > **Alpha Vantage is the only profile allowed to credit-disable on a `200`
 > body.** Its daily-cap envelope is `{"Note":"Thank you for using Alpha

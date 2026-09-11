@@ -252,10 +252,20 @@ func (p *Profile) shouldRotate(status int, body []byte) (bool, string) {
 	}
 	if p.Name == "fmp" {
 		// FMP free tier: 429 "Limit Reach" is a daily-cap exhaust, not a
-		// transient rate-limit. 401 rotates (bad/expired key). Other 4xx/5xx
-		// fall through to transient handling.
+		// transient rate-limit. 401 rotates (bad/expired key).
+		//
+		// 402 is ambiguous:
+		//  - body starts with "Restricted Endpoint:" = the PLAN blocks this
+		//    endpoint for ALL keys under this subscription; rotating the other
+		//    keys would just burn their daily counter without data. Return the
+		//    402 as-is so the caller can pick a free endpoint instead.
+		//  - any other 402 body = could be key-specific (quota/billing); rotate
+		//    so we learn the truth from the next key.
+		if status == 402 && fmpIsRestrictedEndpoint(body) {
+			return false, ""
+		}
 		switch status {
-		case 401, 429:
+		case 401, 402, 429:
 			return true, "status " + strconv.Itoa(status)
 		}
 		return false, ""
@@ -303,6 +313,15 @@ func (p *Profile) shouldRotate(status int, body []byte) (bool, string) {
 // handles them.
 func (p *Profile) isDailyCappedFinance() bool {
 	return p.Name == "fmp" || p.Name == "alphavantage" || p.Name == "marketaux"
+}
+
+// fmpIsRestrictedEndpoint reports whether a 4xx/5xx body is FMP's plan-tier
+// "Restricted Endpoint: This endpoint is not available under your current
+// subscription" refusal. It's a PREFIX match (not Contains) so that a scraped
+// content string can't false-positive — FMP's real refusal bodies start with
+// this literal text.
+func fmpIsRestrictedEndpoint(body []byte) bool {
+	return bytes.HasPrefix(body, []byte("Restricted Endpoint: This endpoint is not available"))
 }
 
 // alphaVantageIsExhausted reports whether a 200 response from Alpha Vantage is

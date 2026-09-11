@@ -156,8 +156,19 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			// $0.000001, a meaningless under-estimate that would still drift
 			// the balance, so exa skips the decrement when it has no cost to
 			// report (costOf returns 0 for it).
-			if cost := costOf(p, res.body); cost > 0 || (p != nil && p.Name != "exa") {
-				p.pool.Decrement(res.idx, cost)
+			//
+			// A second exception: FMP plan-tier 402 ("Restricted Endpoint: ...")
+			// is refused BEFORE the key consumes quota. Decrementing here would
+			// make key0 drop below key1's balance, so Current() would still
+			// silently shift to key1 on the next request - the very rotation
+			// we set out to avoid. Skipping the decrement keeps key0 at its
+			// previous balance and keeps the pool stable across repeated
+			// plan-blocked calls.
+			isPlanBlocked402 := p.Name == "fmp" && res.status == 402 && fmpIsRestrictedEndpoint(res.body)
+			if !isPlanBlocked402 {
+				if cost := costOf(p, res.body); cost > 0 || (p != nil && p.Name != "exa") {
+					p.pool.Decrement(res.idx, cost)
+				}
 			}
 			// Daily-capped finance profiles (fmp/alphavantage/marketaux) disabled
 			// themselves via their own 429/402, not via Decrement: a key sitting
