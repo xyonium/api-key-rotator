@@ -28,7 +28,7 @@ func TestFetchUsage_RetriesOn5xx(t *testing.T) {
 	}))
 	defer fake.Close()
 
-	u := fetchUsage(&http.Client{}, fake.URL, "fc-x", newLogger("info"))
+	u := fetchUsage(&http.Client{}, fake.URL, "fc-x", "firecrawl", newLogger("info"))
 	if !u.ok {
 		t.Fatal("expected ok after retry, got !ok")
 	}
@@ -49,7 +49,7 @@ func TestFetchUsage_NoRetryOn404(t *testing.T) {
 	}))
 	defer fake.Close()
 
-	u := fetchUsage(&http.Client{}, fake.URL, "fc-x", newLogger("info"))
+	u := fetchUsage(&http.Client{}, fake.URL, "fc-x", "firecrawl", newLogger("info"))
 	if u.ok {
 		t.Fatal("expected !ok for 404")
 	}
@@ -67,7 +67,7 @@ func TestFetchUsage_NoRetryOn401(t *testing.T) {
 	}))
 	defer fake.Close()
 
-	u := fetchUsage(&http.Client{}, fake.URL, "fc-x", newLogger("info"))
+	u := fetchUsage(&http.Client{}, fake.URL, "fc-x", "firecrawl", newLogger("info"))
 	if u.ok {
 		t.Fatal("expected !ok for 401")
 	}

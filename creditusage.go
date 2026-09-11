@@ -56,8 +56,8 @@ func usageRetryable(status int) bool {
 // instant. The /v2/team/credit-usage endpoint is read-only and consumes no
 // credits, so it works even after the key is exhausted. Retries transient
 // failures (network, 408, 5xx) with backoff; permanent failures (404/401/403)
-// return immediately. log may be nil.
-func fetchUsage(client *http.Client, upstream, key string, log *logger) usage {
+// return immediately. log may be nil. profile is used only for log labeling.
+func fetchUsage(client *http.Client, upstream, key, profile string, log *logger) usage {
 	const timeout = 5 * time.Second
 	c := client
 	if c == nil {
@@ -83,7 +83,7 @@ func fetchUsage(client *http.Client, upstream, key string, log *logger) usage {
 		time.Sleep(backoff[attempt])
 	}
 	if log != nil {
-		log.warn("credit-usage fetch failed", "reason", lastReason, "masked", maskKey(key))
+		log.warn("credit-usage fetch failed", "profile", profile, "reason", lastReason, "masked", maskKey(key))
 	}
 	return usage{}
 }
@@ -164,7 +164,15 @@ func fetchUsageFor(p *Profile, client *http.Client, key string, log *logger) usa
 	if p.Name == "exa" {
 		return usage{}
 	}
-	return fetchUsage(client, p.Upstream, key, log)
+	// FMP / Alpha Vantage / Marketaux likewise have NO balance endpoint usable
+	// for remaining-requests (their usage gauges live behind a dashboard login
+	// or are per-minute counters, not remaining). Their balances are ACCOUNTED
+	// from the daily-budget seed set in buildProfiles; any endpoint fetch here
+	// would 404/401 forever and feed the warmupLoop retry storm.
+	if p.Name == "fmp" || p.Name == "alphavantage" || p.Name == "marketaux" {
+		return usage{}
+	}
+	return fetchUsage(client, p.Upstream, key, p.Name, log)
 }
 
 // extractExaCostMicro reads an Exa response's costDollars.total (USD, e.g.
@@ -224,7 +232,7 @@ func fetchApifyUsage(client *http.Client, p *Profile, key string, log *logger) u
 		time.Sleep(backoff[attempt])
 	}
 	if log != nil {
-		log.warn("apify limits fetch failed", "reason", lastReason, "masked", maskKey(key))
+		log.warn("apify limits fetch failed", "profile", "apify", "reason", lastReason, "masked", maskKey(key))
 	}
 	return usage{}
 }
@@ -312,7 +320,7 @@ func fetchTavilyUsage(client *http.Client, upstream, key string, log *logger) us
 		time.Sleep(backoff[attempt])
 	}
 	if log != nil {
-		log.warn("tavily usage fetch failed", "reason", lastReason, "masked", maskKey(key))
+		log.warn("tavily usage fetch failed", "profile", "tavily", "reason", lastReason, "masked", maskKey(key))
 	}
 	return usage{}
 }
@@ -404,12 +412,14 @@ func refreshKey(p *Profile, client *http.Client, index int, key string, log *log
 }
 
 // hasPeriodEnd reports whether the profile's usage endpoint can return a real
-// billing-period end, so disableUntilReset should query it. Tavily and Exa
-// cannot (Tavily's /usage returns no period end; Exa has no balance endpoint at
-// all), so they always use the CREDIT_RESET_DAY fallback.
+// billing-period end, so disableUntilReset should query it. Tavily, Exa, and
+// the three daily-capped finance profiles have no such endpoint (Tavily's
+// /usage returns no period end; Exa exposes no balance endpoint; finance
+// profiles' dashboards do not expose remaining programmatically), so they
+// always use the CREDIT_RESET_DAY fallback.
 func hasPeriodEnd(name string) bool {
 	switch name {
-	case "tavily", "exa":
+	case "tavily", "exa", "fmp", "alphavantage", "marketaux":
 		return false
 	}
 	return true

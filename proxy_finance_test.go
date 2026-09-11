@@ -204,14 +204,8 @@ func TestAlphaVantage_DisablesOnRateLimitNoteIn200Body(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("status=%d, want 200; body=%s hits=%v", rec.Code, rec.Body.String(), fake.seen())
 	}
-	nonEmpty := 0
-	for _, h := range fake.seen() {
-		if h != "" {
-			nonEmpty++
-		}
-	}
-	if nonEmpty != 2 || len(fake.seen()) < 2 || fake.seen()[0] != "av-k1" || fake.seen()[1] != "" || fake.seen()[2] != "av-k2" {
-		t.Fatalf("expected rotation: k1 -> (usage fetch) -> k2; got %v", fake.seen())
+	if got := fake.seen(); len(got) != 2 || got[0] != "av-k1" || got[1] != "av-k2" {
+		t.Fatalf("expected rotation: k1 -> k2 (finance profiles make no usage fetch); got %v", got)
 	}
 
 	// A body containing only legitimate data must NOT be scanned - acceptance:
@@ -258,7 +252,7 @@ func TestMarketaux_402UsageLimitReachedDisables(t *testing.T) {
 	if rec.Code != 503 {
 		t.Fatalf("status=%d, want 503 (all keys credit-disabled); body=%s", rec.Code, rec.Body.String())
 	}
-	if got := fake.seen(); len(got) < 2 || got[0] != "mk-k1" || got[2] != "mk-k2" {
+	if got := fake.seen(); len(got) != 2 || got[0] != "mk-k1" || got[1] != "mk-k2" {
 		t.Fatalf("expected keys api_token rotated then both 402; got %v", got)
 	}
 	for i, k := range p.pool.Snapshot().Keys {

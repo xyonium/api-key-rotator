@@ -186,6 +186,12 @@ and risk account flags).
 - A background loop re-enables each key at its own reset instant; restarting
   the container also clears all disables.
 
+  **Exception for daily-capped finance (FMP/Alpha Vantage/Marketaux):** their
+  free tiers reset daily, not on a billing anniversary, so a `429` from FMP or
+  a `402` from Marketaux (and Alpha Vantage's `{"Note":...}` 200 body) means
+  "the daily cap ran out", which does disable until the next
+  `CREDIT_RESET_DAY`. See *Finance profiles* below.
+
 ## Tavily profile
 
 When `TAVILY_API_KEYS` is set, the proxy creates a separate key pool for
@@ -331,6 +337,57 @@ curl -X POST "http://localhost:8788/v2/acts/apimaestro~linkedin-posts-search-scr
   -H "Content-Type: application/json" \
   -d '{"searchUrl":"https://www.linkedin.com/search/results/content/?keywords=ai"}'
 # ?token= is optional - the rotator injects/replaces it from APIFY_API_KEYS.
+```
+
+## Finance profiles: FMP / Alpha Vantage / Marketaux
+
+Three **daily-capped** finance data providers, each with a very small free
+tier. All authenticate via **query param** (`apikey` or `api_token`), are
+routed by strip prefix, and share the same daily-cap behavior: when a key's
+quota is exhausted the key is **disabled until the next `CREDIT_RESET_DAY` at
+00:00 UTC** (not merely cooled down), and when its predicted balance falls to
+the stop threshold it is held back locally so a real upstream `429`/`402`
+never has to fire.
+
+| | FMP | Alpha Vantage | Marketaux |
+|---|---|---|---|
+| Route prefix | `/fmp` (stripped) | `/alphavantage` (stripped) | `/marketaux` (stripped) |
+| Upstream | `https://financialmodelingprep.com` | `https://www.alphavantage.co` | `https://api.marketaux.com` |
+| Auth query param | `apikey` | `apikey` | `api_token` |
+| Free tier | 250 req/day | 25 req/day | 100 req/day |
+| Daily-cap signal | `429` "Limit Reach" | **`200 OK` + body `{"Note":"..."}`/`{"Information":"..."}`** | `402` `usage_limit_reached` |
+| Rotate (transient) | `401` | `401` | `401`, `429` |
+| Credit-exhausted (disables) | `429` | rate-limit `200` body | `402` |
+
+> **Alpha Vantage is the only profile allowed to credit-disable on a `200`
+> body.** Its daily-cap envelope is `{"Note":"Thank you for using Alpha
+> Vantage! ..."}` (or `{"Information":"..."}`) - never a 4xx. Genuine data
+> payloads never contain those keys, so the body scan is safe for this single
+> provider. Every other profile treats a `200` body as opaque success.
+
+Per-provider env vars (`FMP_*`, `ALPHAVANTAGE_*`, `MARKETAUX_*`):
+
+| Variable | FMP default | AlphaVantage default | Marketaux default | Description |
+|---|---|---|---|---|
+| `*_API_KEYS` | — | — | — | Comma-separated keys; enables the profile when set |
+| `*_UPSTREAM` | `https://financialmodelingprep.com` | `https://www.alphavantage.co` | `https://api.marketaux.com` | Upstream base URL |
+| `*_ROUTE_PREFIX` | `/fmp` | `/alphavantage` | `/marketaux` | Path prefix routed here (stripped) |
+| `*_DAILY_BUDGET` | `250` | `25` | `100` | Predicted requests/day, seeded at startup |
+| `*_LOW_CREDIT` | `10` | `5` | `10` | Below this a key refreshes more aggressively |
+| `*_STOP_CREDIT` | `1` | `1` | `1` | Hard floor; at or below this the key is held back, so the last request of the day is never served to the upstream |
+
+Client examples (keys are injected by the rotator - do NOT put a key in the
+URL; any client-supplied `apikey`/`api_token` value is overwritten by the
+pool):
+
+```
+FMP_BASE_URL=http://api-key-rotator:8788/fmp
+ALPHAVANTAGE_BASE_URL=http://api-key-rotator:8788/alphavantage
+MARKETAUX_BASE_URL=http://api-key-rotator:8788/marketaux
+
+curl "http://localhost:8788/fmp/api/v3/profile/AAPL"
+curl "http://localhost:8788/alphavantage/query?function=GLOBAL_QUOTE&symbol=IBM"
+curl "http://localhost:8788/marketaux/v1/news/all?language=en&limit=1"
 ```
 
 ## OpenWebUI + Tavily
