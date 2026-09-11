@@ -34,6 +34,22 @@ services:
       # APIFY_FREE_CREDIT_USD: "5"                  # override included monthly credit (default: read from account)
       # APIFY_LOW_CREDIT_USD: "0.10"                # rotate off a token below this balance
       # APIFY_STOP_CREDIT_USD: "0.05"               # 503 when every token is below this
+      # --- Finance (daily-capped) profiles: /fmp, /alphavantage, /marketaux ---
+      # FMP_API_KEYS: "fmp-k1,fmp-k2"              # FMP free tier ~250 req/day; 429 "Limit Reach" disables until reset
+      # FMP_UPSTREAM: "https://financialmodelingprep.com"
+      # FMP_ROUTE_PREFIX: "/fmp"
+      # FMP_DAILY_BUDGET: "250"                    # predicted requests/day (seeded at startup)
+      # FMP_STOP_CREDIT: "1"                       # 503 when predicted remaining <= this (protects a real 429)
+      # ALPHAVANTAGE_API_KEYS: "av-k1,av-k2"       # free tier 25 req/day; HTTP 200 + body Note = daily cap
+      # ALPHAVANTAGE_UPSTREAM: "https://www.alphavantage.co"
+      # ALPHAVANTAGE_ROUTE_PREFIX: "/alphavantage"
+      # ALPHAVANTAGE_DAILY_BUDGET: "25"
+      # ALPHAVANTAGE_STOP_CREDIT: "1"
+      # MARKETAUX_API_KEYS: "mk-k1,mk-k2"          # free tier 100 req/day; 402 usage_limit_reached disables
+      # MARKETAUX_UPSTREAM: "https://api.marketaux.com"
+      # MARKETAUX_ROUTE_PREFIX: "/marketaux"
+      # MARKETAUX_DAILY_BUDGET: "100"
+      # MARKETAUX_STOP_CREDIT: "1"
     ports:
       - "8788:8788"
     healthcheck:

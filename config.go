@@ -35,6 +35,9 @@ type Config struct {
 	Tavily              TavilyConfig
 	Apify               ApifyConfig
 	Exa                            ExaConfig
+	FMP                   FMPConfig
+	AlphaVantage          AlphaVantageConfig
+	Marketaux             MarketauxConfig
 }
 
 // TavilyConfig holds the Tavily profile's settings. The profile is disabled
@@ -91,6 +94,53 @@ type ApifyConfig struct {
 	FreeCreditUsd    float64 // override for the included monthly credit; 0 = use the account's reported value
 	LowCreditCents   int64   // a measured token at/below this gets refreshed more often (default 10 = $0.10)
 	StopCreditCents  int64   // hard floor: a token below this never serves; 503 when all are below it (default 5 = $0.05)
+}
+
+// FMPConfig holds the FMP profile's settings. The profile is disabled when
+// APIKeys is empty. FMP authenticates with the ?apikey= query param. The free
+// tier is daily-capped (typ. 250 req/day) and signals exhaustion with a real
+// 429 "Limit Reach" status - so a 429 is treated as credit-exhausted (disabled
+// until the daily reset), not a transient rate-limit. No balance endpoint, so
+// the balance is accounted: each key starts at DailyBudget requests and is
+// decremented by 1 on success.
+type FMPConfig struct {
+	APIKeys     []string
+	Upstream    string
+	RoutePrefix string
+	DailyBudget int64 // starting allowance per day; default 250 (free tier)
+	LowCredit   int64 // rotate off a key below this many predicted requests left
+	StopCredit  int64 // 503 when every key is below this
+}
+
+// AlphaVantageConfig holds the Alpha Vantage profile's settings. The profile
+// is disabled when APIKeys is empty. Alpha Vantage authenticates with the
+// ?apikey= query param. Its peculiar trait: rate-limit/daily-cap exhaustion is
+// reported as HTTP 200 with a JSON body containing a "Note" (or "Information")
+// message, NOT a 4xx - so it is the ONE profile allowed to scan a 200 body for
+// an exhaustion signal. A genuine data response never contains those keys.
+// Free tier is 25 requests/day, so DailyBudget defaults to 25.
+type AlphaVantageConfig struct {
+	APIKeys     []string
+	Upstream    string
+	RoutePrefix string
+	DailyBudget int64 // default 25 (free tier daily request cap)
+	LowCredit   int64
+	StopCredit  int64
+}
+
+// MarketauxConfig holds the Marketaux profile's settings. The profile is
+// disabled when APIKeys is empty. Marketaux authenticates with the ?api_token=
+// query param. Errors are an error-code + HTTP status envelope: 401
+// invalid_api_token rotates, 402 usage_limit_reached is credit-exhausted
+// (disabled until the daily reset), 429 rate_limit rotates. Free tier is daily
+// (typ. 100 req/day), so DailyBudget defaults to 100.
+type MarketauxConfig struct {
+	APIKeys     []string
+	Upstream    string
+	RoutePrefix string
+	DailyBudget int64 // default 100 (free tier daily request cap)
+	LowCredit   int64
+	StopCredit  int64
 }
 
 func envStr(key, def string) string {
@@ -240,6 +290,19 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 
+	fmp, err := loadFMPConfig()
+	if err != nil {
+		return Config{}, err
+	}
+	alpha, err := loadAlphaVantageConfig()
+	if err != nil {
+		return Config{}, err
+	}
+	marketaux, err := loadMarketauxConfig()
+	if err != nil {
+		return Config{}, err
+	}
+
 	maxConc, err := envInt("FIRECRAWL_MAX_CONCURRENT_PER_KEY", 1)
 	if err != nil {
 		return Config{}, err
@@ -264,6 +327,9 @@ func LoadConfig() (Config, error) {
 		Tavily:        tavily,
 		Apify:         apify,
 		Exa:                            exa,
+		FMP:                            fmp,
+		AlphaVantage:                   alpha,
+		Marketaux:                      marketaux,
 		Upstream:      strings.TrimRight(upstream, "/"),
 		UpstreamHost:  u.Host,
 		Port:          envStr("PORT", "8788"),
@@ -387,6 +453,175 @@ func loadApifyConfig() (ApifyConfig, error) {
 	}
 	a.LowCreditCents, a.StopCreditCents = low, stop
 	return a, nil
+}
+
+// checkRoutePrefix validates a finance profile's strip-prefix. Same rules as
+// tavily's: leading slash, non-root, no trailing slash, no /healthz|/status.
+func checkRoutePrefix(name, prefix string) error {
+	if !strings.HasPrefix(prefix, "/") || len(prefix) < 2 || strings.HasSuffix(prefix, "/") {
+		return fmt.Errorf("%s_ROUTE_PREFIX %q must start with '/' and be a non-root path without trailing slash", name, prefix)
+	}
+	if prefix == "/healthz" || prefix == "/status" {
+		return fmt.Errorf("%s_ROUTE_PREFIX %q shadows a reserved path", name, prefix)
+	}
+	return nil
+}
+
+// parseOptInt64 parses a non-negative int64 env override. The returned bool is
+// false when the env var is absent (caller keeps its default) or unparsable.
+func parseOptInt64(name string) (int64, bool, error) {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return 0, false, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return 0, false, fmt.Errorf("%s must be a non-negative integer, got %q", name, v)
+	}
+	return n, true, nil
+}
+
+// parseDailyBudget parses a positive daily request allowance (e.g. FMP free
+// tier 250/day, Alpha Vantage 25/day). Must be >= 1 so "budget 0" can't mean
+// "disabled" - it would silently stack every key at zero remaining.
+func parseDailyBudget(name string) (int64, bool, error) {
+	n, set, err := parseOptInt64(name)
+	if err != nil {
+		return 0, false, err
+	}
+	if set && n < 1 {
+		return 0, false, fmt.Errorf("%s must be a positive integer, got %d", name, n)
+	}
+	return n, set, nil
+}
+
+// financeDailyThresholds resolves the LOW/STOP pair for a daily-capped finance
+// profile, applying the three budget env vars when set. Stop defaults to 1 so
+// a key never serves its very last predicted request (protects the upstream
+// from a real 429 that would deepen a ban).
+func financeDailyThresholds(lowName, stopName, budgetName string, defLow, defStop int64) (budget, low, stop int64, err error) {
+	budget, budgetSet, err := parseDailyBudget(budgetName)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	low, lowSet, err := parseOptInt64(lowName)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	stop, stopSet, err := parseOptInt64(stopName)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if !budgetSet {
+		budget = -1
+	}
+	if !lowSet {
+		low = defLow
+	}
+	if !stopSet {
+		stop = defStop
+	}
+	if budgetSet && stop > budget {
+		return 0, 0, 0, fmt.Errorf("%s (%d) must be <= %s (%d)", stopName, stop, budgetName, budget)
+	}
+	if stop > low {
+		return 0, 0, 0, fmt.Errorf("%s (%d) must be <= %s (%d)", stopName, stop, lowName, low)
+	}
+	return budget, low, stop, nil
+}
+
+// loadFMPConfig parses FMP_* env vars. The free tier is daily-capped (typ.
+// 250 req/day) and reports exhaustion with a real 429 "Limit Reach"; see
+// FMPConfig for why 429 is treated as credit-exhausted instead of a
+// transient rate-limit.
+func loadFMPConfig() (FMPConfig, error) {
+	f := FMPConfig{
+		APIKeys:     parseKeys(os.Getenv("FMP_API_KEYS")),
+		RoutePrefix: envStr("FMP_ROUTE_PREFIX", "/fmp"),
+		DailyBudget: 250,
+		LowCredit:   10,
+		StopCredit:  1,
+	}
+	upstream := envStr("FMP_UPSTREAM", "https://financialmodelingprep.com")
+	u, err := url.Parse(upstream)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return FMPConfig{}, fmt.Errorf("FMP_UPSTREAM %q is not a valid http(s) URL", upstream)
+	}
+	f.Upstream = strings.TrimRight(upstream, "/")
+	if err := checkRoutePrefix("FMP", f.RoutePrefix); err != nil {
+		return FMPConfig{}, err
+	}
+	budget, low, stop, err := financeDailyThresholds("FMP_LOW_CREDIT", "FMP_STOP_CREDIT", "FMP_DAILY_BUDGET", f.LowCredit, f.StopCredit)
+	if err != nil {
+		return FMPConfig{}, err
+	}
+	if budget > 0 {
+		f.DailyBudget = budget
+	}
+	f.LowCredit, f.StopCredit = low, stop
+	return f, nil
+}
+
+// loadAlphaVantageConfig parses ALPHAVANTAGE_* env vars. Alpha Vantage free
+// tier is 25 requests/day and reports exhaustion in an HTTP 200 body
+// containing "Note" - this profile is the one allowed to scan a 200 body.
+func loadAlphaVantageConfig() (AlphaVantageConfig, error) {
+	a := AlphaVantageConfig{
+		APIKeys:     parseKeys(os.Getenv("ALPHAVANTAGE_API_KEYS")),
+		RoutePrefix: envStr("ALPHAVANTAGE_ROUTE_PREFIX", "/alphavantage"),
+		DailyBudget: 25,
+		LowCredit:   5,
+		StopCredit:  1,
+	}
+	upstream := envStr("ALPHAVANTAGE_UPSTREAM", "https://www.alphavantage.co")
+	u, err := url.Parse(upstream)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return AlphaVantageConfig{}, fmt.Errorf("ALPHAVANTAGE_UPSTREAM %q is not a valid http(s) URL", upstream)
+	}
+	a.Upstream = strings.TrimRight(upstream, "/")
+	if err := checkRoutePrefix("ALPHAVANTAGE", a.RoutePrefix); err != nil {
+		return AlphaVantageConfig{}, err
+	}
+	budget, low, stop, err := financeDailyThresholds("ALPHAVANTAGE_LOW_CREDIT", "ALPHAVANTAGE_STOP_CREDIT", "ALPHAVANTAGE_DAILY_BUDGET", a.LowCredit, a.StopCredit)
+	if err != nil {
+		return AlphaVantageConfig{}, err
+	}
+	if budget > 0 {
+		a.DailyBudget = budget
+	}
+	a.LowCredit, a.StopCredit = low, stop
+	return a, nil
+}
+
+// loadMarketauxConfig parses MARKETAUX_* env vars. Marketaux errors are an
+// error-code + status envelope: 401 invalid_api_token, 402
+// usage_limit_reached (credit-exhausted), 429 rate_limit.
+func loadMarketauxConfig() (MarketauxConfig, error) {
+	m := MarketauxConfig{
+		APIKeys:     parseKeys(os.Getenv("MARKETAUX_API_KEYS")),
+		RoutePrefix: envStr("MARKETAUX_ROUTE_PREFIX", "/marketaux"),
+		DailyBudget: 100,
+		LowCredit:   10,
+		StopCredit:  1,
+	}
+	upstream := envStr("MARKETAUX_UPSTREAM", "https://api.marketaux.com")
+	u, err := url.Parse(upstream)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return MarketauxConfig{}, fmt.Errorf("MARKETAUX_UPSTREAM %q is not a valid http(s) URL", upstream)
+	}
+	m.Upstream = strings.TrimRight(upstream, "/")
+	if err := checkRoutePrefix("MARKETAUX", m.RoutePrefix); err != nil {
+		return MarketauxConfig{}, err
+	}
+	budget, low, stop, err := financeDailyThresholds("MARKETAUX_LOW_CREDIT", "MARKETAUX_STOP_CREDIT", "MARKETAUX_DAILY_BUDGET", m.LowCredit, m.StopCredit)
+	if err != nil {
+		return MarketauxConfig{}, err
+	}
+	if budget > 0 {
+		m.DailyBudget = budget
+	}
+	m.LowCredit, m.StopCredit = low, stop
+	return m, nil
 }
 
 // loadExaConfig parses the EXA_* env vars. The route prefix must start with

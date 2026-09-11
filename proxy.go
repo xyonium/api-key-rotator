@@ -159,6 +159,17 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			if cost := costOf(p, res.body); cost > 0 || (p != nil && p.Name != "exa") {
 				p.pool.Decrement(res.idx, cost)
 			}
+			// Daily-capped finance profiles (fmp/alphavantage/marketaux) disabled
+			// themselves via their own 429/402, not via Decrement: a key sitting
+			// at PredictedRemaining == StopCredit should refuse BEFORE it can
+			// serve a real upstream request (protects the last minute of the day).
+			if p != nil && p.isDailyCappedFinance() && res.idx >= 0 {
+				// clamp: a key that has dipped to its stop threshold is ephemeral
+				// (any other usable key will win next); don't let it serve again.
+				if v := p.pool.PredictedRemaining(res.idx); v >= 0 && v <= p.pool.StopThreshold() {
+					p.pool.Disable(res.idx, time.Now().Add(rotateCooldown))
+				}
+			}
 			if p.refresh != nil {
 				p.refresh.MaybeRefreshLow(res.idx)
 			}

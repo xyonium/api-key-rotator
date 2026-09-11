@@ -373,6 +373,25 @@ func (p *KeyPool) Decrement(index int, cost int64) {
 	p.remainingCredits[index] = rc
 }
 
+// PredictedRemaining returns the pool's current predicted remaining credits
+// for a key (or -1 for unmeasured). Keys never expose this on the wire; tests
+// use it to verify stop-threshold enforcement for daily-capped providers.
+func (p *KeyPool) PredictedRemaining(index int) int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if index < 0 || index >= len(p.remainingCredits) {
+		return -1
+	}
+	rc := p.remainingCredits[index]
+	if rc == math.MaxInt64 {
+		return -1
+	}
+	return rc
+}
+
+// StopThreshold returns the pool's hard floor (a key below this never serves).
+func (p *KeyPool) StopThreshold() int64 { return p.stopThreshold }
+
 // SetCredits records a real remainingCredits value from /v2/team/credit-usage.
 func (p *KeyPool) SetCredits(index int, credits int64) {
 	p.mu.Lock()

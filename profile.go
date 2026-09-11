@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"net/http"
 	"strconv"
 	"strings"
@@ -144,6 +145,71 @@ func buildProfiles(cfg Config) []*Profile {
 			pool:               apPool,
 		})
 	}
+
+	if len(cfg.FMP.APIKeys) > 0 {
+		fPool := NewKeyPool(cfg.FMP.APIKeys)
+		fPool.SetThresholds(cfg.FMP.LowCredit, cfg.FMP.StopCredit)
+		host := cfg.FMP.Upstream
+		if i := strings.Index(host, "://"); i >= 0 {
+			host = host[i+3:]
+		}
+		// Seed each key at the daily budget so selection is gated from the
+		// first request (no balance endpoint). Decrement by 1 per success.
+		for i := range cfg.FMP.APIKeys {
+			fPool.SetCredits(i, cfg.FMP.DailyBudget)
+		}
+		profiles = append(profiles, &Profile{
+			Name:           "fmp",
+			RoutePrefix:    cfg.FMP.RoutePrefix,
+			Upstream:       cfg.FMP.Upstream,
+			UpstreamHost:   host,
+			CreditResetDay: cfg.CreditResetDay,
+			AuthQueryParam: "apikey",
+			pool:           fPool,
+		})
+	}
+
+	if len(cfg.AlphaVantage.APIKeys) > 0 {
+		aPool := NewKeyPool(cfg.AlphaVantage.APIKeys)
+		aPool.SetThresholds(cfg.AlphaVantage.LowCredit, cfg.AlphaVantage.StopCredit)
+		host := cfg.AlphaVantage.Upstream
+		if i := strings.Index(host, "://"); i >= 0 {
+			host = host[i+3:]
+		}
+		for i := range cfg.AlphaVantage.APIKeys {
+			aPool.SetCredits(i, cfg.AlphaVantage.DailyBudget)
+		}
+		profiles = append(profiles, &Profile{
+			Name:           "alphavantage",
+			RoutePrefix:    cfg.AlphaVantage.RoutePrefix,
+			Upstream:       cfg.AlphaVantage.Upstream,
+			UpstreamHost:   host,
+			CreditResetDay: cfg.CreditResetDay,
+			AuthQueryParam: "apikey",
+			pool:           aPool,
+		})
+	}
+
+	if len(cfg.Marketaux.APIKeys) > 0 {
+		mPool := NewKeyPool(cfg.Marketaux.APIKeys)
+		mPool.SetThresholds(cfg.Marketaux.LowCredit, cfg.Marketaux.StopCredit)
+		host := cfg.Marketaux.Upstream
+		if i := strings.Index(host, "://"); i >= 0 {
+			host = host[i+3:]
+		}
+		for i := range cfg.Marketaux.APIKeys {
+			mPool.SetCredits(i, cfg.Marketaux.DailyBudget)
+		}
+		profiles = append(profiles, &Profile{
+			Name:           "marketaux",
+			RoutePrefix:    cfg.Marketaux.RoutePrefix,
+			Upstream:       cfg.Marketaux.Upstream,
+			UpstreamHost:   host,
+			CreditResetDay: cfg.CreditResetDay,
+			AuthQueryParam: "api_token",
+			pool:           mPool,
+		})
+	}
 	return profiles
 }
 //
@@ -184,6 +250,38 @@ func (p *Profile) shouldRotate(status int, body []byte) (bool, string) {
 		}
 		return false, ""
 	}
+	if p.Name == "fmp" {
+		// FMP free tier: 429 "Limit Reach" is a daily-cap exhaust, not a
+		// transient rate-limit. 401 rotates (bad/expired key). Other 4xx/5xx
+		// fall through to transient handling.
+		switch status {
+		case 401, 429:
+			return true, "status " + strconv.Itoa(status)
+		}
+		return false, ""
+	}
+	if p.Name == "alphavantage" {
+		// Alpha Vantage reports daily-cap exhaustion as HTTP 200 + JSON body
+		// with a "Note" field (not a 4xx). This is the ONE profile allowed to
+		// scan a 200 body: a genuine data response never contains the key.
+		// We rotate on any 200 body that contains the rate-limit phrase; the
+		// downstream caller (isCreditExhausted) decides whether to disable.
+		if status == 200 && alphaVantageIsExhausted(body) {
+			return true, "body:rate-limit Note"
+		}
+		switch status {
+		case 401:
+			return true, "status " + strconv.Itoa(status)
+		}
+		return false, ""
+	}
+	if p.Name == "marketaux" {
+		switch status {
+		case 401, 402, 429:
+			return true, "status " + strconv.Itoa(status)
+		}
+		return false, ""
+	}
 	// firecrawl (default)
 	switch status {
 	case 402, 429, 401:
@@ -196,6 +294,27 @@ func (p *Profile) shouldRotate(status int, body []byte) (bool, string) {
 		return true, "body:" + string(m)
 	}
 	return false, ""
+}
+
+// isDailyCappedFinance reports whether this profile's free tier resets daily
+// (so a low predicted balance should block the LAST request instead of letting
+// it fire a real upstream 429/402 to learn the truth). Firecrawl/tavily/exa
+// don't need this guard - they recover quickly and threshold logic already
+// handles them.
+func (p *Profile) isDailyCappedFinance() bool {
+	return p.Name == "fmp" || p.Name == "alphavantage" || p.Name == "marketaux"
+}
+
+// alphaVantageIsExhausted reports whether a 200 response from Alpha Vantage is
+// the daily-cap "Thank you for using Alpha Vantage! ..." note (or its sibling
+// "Information" message). Genuine data payloads never contain these keys, so
+// scanning a success body is safe for THIS profile ONLY.
+func alphaVantageIsExhausted(body []byte) bool {
+	// Cheap substring match on the two documented rate-limit envelopes.
+	// Examples: {"Note":"Thank you for using Alpha Vantage! Our standard API rate limit is ..."}
+	//           {"Information":"Thank you for using Alpha Vantage! ..."}
+	return bytes.Contains(body, []byte(`"Note"`)) ||
+		bytes.Contains(body, []byte(`"Information"`))
 }
 
 // isCreditExhausted reports whether a rejection means the key's credits are
@@ -216,6 +335,23 @@ func (p *Profile) isCreditExhausted(status int, body []byte) bool {
 	// API_KEY_BUDGET_EXCEEDED / TEAM_BUDGET_EXCEEDED). Exa uses the x402
 	// payment protocol, so this is a real 402, not a 200-with-error-body.
 	if p.Name == "exa" {
+		return status == 402
+	}
+	// FMP: the free-tier 429 "Limit Reach" is a daily cap, not a transient
+	// rate-limit (a rate-limit would come back in seconds; this only resets
+	// at midnight UTC). Disabling until reset is exactly what the key needs.
+	if p.Name == "fmp" {
+		return status == 429
+	}
+	// Alpha Vantage: 200 + Note/Information body. This is the ONLY profile
+	// allowed to credit-disable on a 200 - and only when shouldRotate has
+	// already confirmed the exact rate-limit phrase.
+	if p.Name == "alphavantage" {
+		return status == 200 && alphaVantageIsExhausted(body)
+	}
+	// Marketaux: 402 is its daily-cap "usage_limit_reached" (not a payment
+	// failure like firecrawl). 429 is a true rate-limit.
+	if p.Name == "marketaux" {
 		return status == 402
 	}
 	if status == 402 {
