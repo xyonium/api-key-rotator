@@ -50,6 +50,10 @@ type rotResult struct {
 	status int
 	header http.Header
 	body   []byte
+	// lastErr carries tryKey's last failure description (net.Err text or
+	// "status N"). Empty on success. Only set for resNetErr so the rotation
+	// warn log can say WHY the key was given up.
+	lastErr string
 }
 
 // serveOnce performs one rotation attempt: pick a key, acquire its in-flight
@@ -74,12 +78,12 @@ func (r *rotator) serveOnce(p *Profile, req *http.Request, inBody []byte, stripp
 		p.refresh.EnsureMeasured(idx)
 	}
 
-	status, header, body, capped, netErr := r.tryKey(req, p, idx, key, inBody, strippedPath)
+	status, header, body, capped, netErr, lastErr := r.tryKey(req, p, idx, key, inBody, strippedPath)
 	if capped {
 		return rotResult{kind: resCapped, idx: idx, key: key, status: status, header: header, body: body}
 	}
 	if netErr {
-		return rotResult{kind: resNetErr, idx: idx, key: key, status: status, header: header, body: body}
+		return rotResult{kind: resNetErr, idx: idx, key: key, status: status, header: header, body: body, lastErr: lastErr}
 	}
 	if rotate, reason := p.shouldRotate(status, body); rotate {
 		if status == 429 && isConcurrency429(body) {
@@ -190,7 +194,11 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			cleanBreak = true
 			r.log.warn("response body over MAX_BODY_BYTES, forwarding untouched", "profile", p.Name, "key", res.idx)
 		case resNetErr:
-			r.log.warn("transient errors exhausted on key, rotating", "profile", p.Name, "key", res.idx)
+			// lastErr carries the underlying cause (net.Err with dial/DNS/TLS
+			// detail, or "status N" for a persisted 403/5xx). Without it the
+			// warn was a bare "exhausted" and ops had to guess between upstream
+			// down vs egress IP blocked vs credential issue.
+			r.log.warn("transient errors exhausted on key, rotating", "profile", p.Name, "key", res.idx, "status", res.status, "cause", res.lastErr)
 			prev := res.idx
 			p.pool.AdvanceAfter(res.header)
 			if next, _ := p.pool.Current(); next >= 0 && p.refresh != nil {
@@ -222,7 +230,16 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if !cleanBreak {
-		r.log.warn("all keys exhausted", "profile", p.Name, "lastStatus", lastStatus, "keys", p.pool.Snapshot().Keys, "maxPasses", r.cfg.MaxPasses)
+		// lastStatus==0 means NO key even got an HTTP response (netErr on every
+		// attempt). That's network/DNS/TLS or an egress-IP block, NOT "keys
+		// exhausted". Say so explicitly so a client doesn't misread this as
+		// "quota burned" and start rotating keys in the dashboard.
+		if lastStatus == 0 {
+			r.log.warn("all keys unreachable (network/DNS/TLS or egress blocked) - upstream unavailable",
+				"profile", p.Name, "keys", p.pool.Snapshot().Keys, "maxPasses", r.cfg.MaxPasses)
+		} else {
+			r.log.warn("all keys exhausted", "profile", p.Name, "lastStatus", lastStatus, "keys", p.pool.Snapshot().Keys, "maxPasses", r.cfg.MaxPasses)
+		}
 	}
 
 	if overCap {
@@ -238,9 +255,10 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// On exhaustion with a non-503 last status, surface the last error verbatim
-	// (e.g. a real 401/402). lastStatus 0 means we never got a response.
+	// (e.g. a real 401/402). lastStatus 0 means we never got a response; tell
+	// the client it was an egress/network problem so they don't go rotate keys.
 	if !cleanBreak && lastStatus == 0 {
-		http.Error(w, `{"success":false,"error":"upstream unavailable"}`, http.StatusBadGateway)
+		http.Error(w, `{"success":false,"error":"upstream unreachable (network/DNS/TLS or egress blocked)"}`, http.StatusBadGateway)
 		return
 	}
 
@@ -265,13 +283,17 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 // tryKey sends one request with the given key, retrying transient errors
 // (network/403/5xx) with exponential backoff on the SAME key. Returns the final
-// status/header/body, whether the body was over the cap, and netErr=true if the
-// key gave up after exhausting backoff retries (caller rotates).
-func (r *rotator) tryKey(req *http.Request, p *Profile, idx int, key string, inBody []byte, strippedPath string) (status int, header http.Header, body []byte, capped bool, netErr bool) {
+// status/header/body, whether the body was over the cap, netErr=true if the key
+// gave up after exhausting backoff retries (caller rotates), and lastErr, a
+// one-line description of the most recent failure (net.Err text or "status N")
+// so the resNetErr log line can say exactly what went wrong (DNS/connect/TLS/
+// 5xx) instead of a bare "exhausted".
+func (r *rotator) tryKey(req *http.Request, p *Profile, idx int, key string, inBody []byte, strippedPath string) (status int, header http.Header, body []byte, capped bool, netErr bool, lastErr string) {
 	client := r.client
 	if p.client != nil {
 		client = p.client
 	}
+	lastErr = "no attempt"
 	for attempt := 0; attempt < len(backoffSchedule)+1; attempt++ {
 		upstreamURL := p.Upstream + strippedPath
 		if req.URL.RawQuery != "" {
@@ -279,7 +301,7 @@ func (r *rotator) tryKey(req *http.Request, p *Profile, idx int, key string, inB
 		}
 		upReq, err := http.NewRequestWithContext(req.Context(), req.Method, upstreamURL, bytes.NewReader(inBody))
 		if err != nil {
-			return 0, nil, nil, false, true
+			return 0, nil, nil, false, true, "build request: " + err.Error()
 		}
 		copyHeaders(upReq.Header, req.Header)
 		upReq.Header.Del("Authorization")
@@ -307,13 +329,14 @@ func (r *rotator) tryKey(req *http.Request, p *Profile, idx int, key string, inB
 
 		resp, err := client.Do(upReq)
 		if err != nil {
+			lastErr = "net: " + err.Error()
 			// network error: retry same key with backoff if attempts remain
 			if attempt < len(backoffSchedule) && r.sleepOrCancel(req, backoffSchedule[attempt]) {
-				return 0, nil, nil, false, true // client canceled
+				return 0, nil, nil, false, true, "canceled"
 			}
 			if attempt >= len(backoffSchedule) {
 				r.log.warn("upstream request error, giving up on key", "profile", p.Name, "key", idx, "err", err)
-				return 0, nil, nil, false, true
+				return 0, nil, nil, false, true, lastErr
 			}
 			continue
 		}
@@ -322,10 +345,11 @@ func (r *rotator) tryKey(req *http.Request, p *Profile, idx int, key string, inB
 		_ = resp.Body.Close()
 
 		if overCap {
-			return resp.StatusCode, resp.Header, b, true, false
+			return resp.StatusCode, resp.Header, b, true, false, ""
 		}
 
 		if shouldRetry(resp.StatusCode, false) {
+			lastErr = "status " + strconv.Itoa(resp.StatusCode)
 			// transient status (403/5xx): backoff and retry SAME key. A 403 gets
 			// a smaller budget (Firecrawl documents it as non-retryable - it's a
 			// permission/edge block, so hammering it 6x per key just churns);
@@ -337,18 +361,18 @@ func (r *rotator) tryKey(req *http.Request, p *Profile, idx int, key string, inB
 			if attempt < budget {
 				r.log.warn("transient upstream status, backing off", "profile", p.Name, "key", idx, "status", resp.StatusCode, "attempt", attempt+1)
 				if r.sleepOrCancel(req, backoffSchedule[attempt]) {
-					return resp.StatusCode, resp.Header, b, false, true
+					return resp.StatusCode, resp.Header, b, false, true, "canceled"
 				}
 				continue
 			}
 			// backoff exhausted on this key: signal rotate
 			r.log.warn("transient status persisted, rotating", "profile", p.Name, "key", idx, "status", resp.StatusCode)
-			return resp.StatusCode, resp.Header, b, false, true
+			return resp.StatusCode, resp.Header, b, false, true, lastErr
 		}
 
-		return resp.StatusCode, resp.Header, b, false, false
+		return resp.StatusCode, resp.Header, b, false, false, ""
 	}
-	return 0, nil, nil, false, true
+	return 0, nil, nil, false, true, lastErr
 }
 
 // sleepOrCancel sleeps for d, returning true if the request was canceled during
