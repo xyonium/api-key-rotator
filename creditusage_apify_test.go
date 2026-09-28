@@ -208,7 +208,7 @@ func TestRotator_ApifyLowCreditStops(t *testing.T) {
 
 	// First request: EnsureMeasured pulls the 3-cent balance, then the pool
 	// refuses (3 < 5 stop), so 503 and the actor endpoint is never hit.
-	rec := post(t, r, "/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
+	rec := post(t, r, "/apify/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
 	if rec.Code != 503 {
 		t.Fatalf("status = %d, want 503 (balance below stop threshold)", rec.Code)
 	}

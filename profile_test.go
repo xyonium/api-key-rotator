@@ -10,7 +10,7 @@ import (
 func profilesForTest() []*Profile {
 	fc := &Profile{Name: "firecrawl", RoutePrefix: "", pool: NewKeyPool([]string{"fc-a"})}
 	tv := &Profile{Name: "tavily", RoutePrefix: "/tavily", pool: NewKeyPool([]string{"tvly-a"})}
-	ap := &Profile{Name: "apify", RoutePrefix: "/v2/acts", KeepPrefix: true, AuthQueryParam: "token", pool: NewKeyPool([]string{"apify-a"})}
+	ap := &Profile{Name: "apify", RoutePrefix: "/apify", KeepPrefix: false, AuthQueryParam: "token", pool: NewKeyPool([]string{"apify-a"})}
 	ex := &Profile{Name: "exa", RoutePrefix: "/exa", AuthHeader: "x-api-key", pool: NewKeyPool([]string{"exa-a"})}
 	return []*Profile{fc, tv, ap, ex}
 }
@@ -28,16 +28,17 @@ func TestMatchProfile(t *testing.T) {
 		{"/tavily/extract", "tavily", "/extract", true},
 		{"/tavily", "tavily", "/", true},
 		{"/tavilyfoo/search", "firecrawl", "/tavilyfoo/search", true},                                         // no segment boundary -> default
-		{"/v2/acts/u~a/run-sync-get-dataset-items", "apify", "/v2/acts/u~a/run-sync-get-dataset-items", true}, // kept whole
-		{"/v2/acts", "apify", "/v2/acts", true},                                                               // exact match also kept whole
-		{"/v2/actsfoo/x", "firecrawl", "/v2/actsfoo/x", true},                                                 // no segment boundary -> default
+		{"/apify/v2/acts/u~a/run-sync-get-dataset-items", "apify", "/v2/acts/u~a/run-sync-get-dataset-items", true}, // stripped
+		{"/apify", "apify", "/", true},                                                                              // exact match -> bare root
+		{"/apifyfoo/x", "firecrawl", "/apifyfoo/x", true},                                                           // no segment boundary -> default
+		{"/v2/acts/u~a/run-sync-get-dataset-items", "firecrawl", "/v2/acts/u~a/run-sync-get-dataset-items", true},   // old bare path no longer routes to apify
 		{"/exa/search", "exa", "/search", true},
 		{"/exa", "exa", "/", true},
 		{"/exafoo/search", "firecrawl", "/exafoo/search", true}, // no segment boundary -> default
 		{"/", "firecrawl", "/", true},
 	}
 	for _, c := range cases {
-		p, stripped, ok := matchProfile(profiles, c.path)
+		p, stripped, ok := matchProfile(profiles, c.path, true)
 		if !ok || p.Name != c.wantName || stripped != c.wantStripped {
 			t.Errorf("matchProfile(%q) = (%v, %q, %v), want (%s, %q, true)",
 				c.path, p, stripped, ok, c.wantName, c.wantStripped)
@@ -49,9 +50,76 @@ func TestMatchProfile_unconfiguredPrefixFallsToDefault(t *testing.T) {
 	// Only the firecrawl profile configured: /tavily/... falls through to the
 	// default profile (byte-compat: single-profile deployments change nothing).
 	profiles := []*Profile{{Name: "firecrawl", RoutePrefix: "", pool: NewKeyPool([]string{"fc-a"})}}
-	p, stripped, ok := matchProfile(profiles, "/tavily/search")
+	p, stripped, ok := matchProfile(profiles, "/tavily/search", true)
 	if !ok || p.Name != "firecrawl" || stripped != "/tavily/search" {
 		t.Fatalf("matchProfile = (%v, %q, %v), want firecrawl default fallthrough", p, stripped, ok)
+	}
+}
+
+func profilesForPrefixTest() []*Profile {
+	fc := &Profile{Name: "firecrawl", RoutePrefix: "/firecrawl", pool: NewKeyPool([]string{"fc-a"})}
+	tv := &Profile{Name: "tavily", RoutePrefix: "/tavily", pool: NewKeyPool([]string{"tvly-a"})}
+	return []*Profile{fc, tv}
+}
+
+func TestMatchProfile_firecrawlPrefixStripped(t *testing.T) {
+	// The /firecrawl prefix routes to the firecrawl profile and is stripped.
+	profiles := profilesForPrefixTest()
+	cases := []struct {
+		path         string
+		wantStripped string
+	}{
+		{"/firecrawl", "/"},
+		{"/firecrawl/v2/scrape", "/v2/scrape"},
+		{"/firecrawl/v2/search", "/v2/search"},
+		{"/firecrawl/v2/crawl/abc", "/v2/crawl/abc"},
+		{"/firecrawl/v1/scrape", "/v1/scrape"},
+	}
+	for _, c := range cases {
+		p, stripped, ok := matchProfile(profiles, c.path, true)
+		if !ok || p.Name != "firecrawl" || stripped != c.wantStripped {
+			t.Errorf("matchProfile(%q) = (%v, %q, %v), want (firecrawl, %q, true)",
+				c.path, p, stripped, ok, c.wantStripped)
+		}
+	}
+}
+
+func TestMatchProfile_firecrawlLegacyFallbackOn(t *testing.T) {
+	// Legacy fallback kept on: unrecognized paths still go to firecrawl
+	// (unstripped), exactly the historic behaviour while callers migrate.
+	profiles := profilesForPrefixTest()
+	cases := []string{"/v2/scrape", "/v1/scrape", "/tav/foo", "/"}
+	for _, path := range cases {
+		p, stripped, ok := matchProfile(profiles, path, true)
+		if !ok || p.Name != "firecrawl" || stripped != path {
+			t.Errorf("matchProfile(%q, legacy=true) = (%v, %q, %v), want (firecrawl, %q, true)",
+				path, p, stripped, ok, path)
+		}
+	}
+	// Explicit-prefixed profiles still match first.
+	p, stripped, ok := matchProfile(profiles, "/tavily/search", true)
+	if !ok || p.Name != "tavily" || stripped != "/search" {
+		t.Errorf("matchProfile /tavily/search = (%v, %q, %v), want (tavily, /search, true)", p, stripped, ok)
+	}
+}
+
+func TestMatchProfile_firecrawlLegacyFallbackOff(t *testing.T) {
+	// Legacy fallback off: unrecognized paths return ok=false.
+	profiles := profilesForPrefixTest()
+	for _, path := range []string{"/v2/scrape", "/v1/scrape", "/tav/foo", "/"} {
+		p, _, ok := matchProfile(profiles, path, false)
+		if ok || p != nil {
+			t.Errorf("matchProfile(%q, legacy=false) = (%v,_,%v), want (nil,_,false)", path, p, ok)
+		}
+	}
+	// Explicit prefixes still work.
+	p, stripped, ok := matchProfile(profiles, "/tavily/search", false)
+	if !ok || p.Name != "tavily" || stripped != "/search" {
+		t.Errorf("matchProfile /tavily/search = (%v, %q, %v), want (tavily, /search, true)", p, stripped, ok)
+	}
+	p, stripped, ok = matchProfile(profiles, "/firecrawl/v2/scrape", false)
+	if !ok || p.Name != "firecrawl" || stripped != "/v2/scrape" {
+		t.Errorf("matchProfile /firecrawl/v2/scrape = (%v, %q, %v), want (firecrawl, /v2/scrape, true)", p, stripped, ok)
 	}
 }
 
@@ -349,7 +417,7 @@ func TestBuildProfiles_withApify(t *testing.T) {
 		Apify: ApifyConfig{
 			APIKeys:         []string{"apify-a", "apify-b"},
 			Upstream:        "https://api.apify.com",
-			RoutePrefix:     "/v2/acts",
+			RoutePrefix:     "/apify",
 			TimeoutSec:      180,
 			FreeCreditUsd:   7.5, // explicit override flows through to the profile
 			LowCreditCents:  10,
@@ -361,7 +429,7 @@ func TestBuildProfiles_withApify(t *testing.T) {
 		t.Fatalf("len = %d, want 2", len(profiles))
 	}
 	ap := profiles[1]
-	if ap.Name != "apify" || ap.RoutePrefix != "/v2/acts" || ap.RewriteNext {
+	if ap.Name != "apify" || ap.RoutePrefix != "/apify" || ap.RewriteNext {
 		t.Fatalf("apify profile = %+v", ap)
 	}
 	if ap.UpstreamHost != "api.apify.com" {
@@ -397,7 +465,7 @@ func TestApifyDisable_UsesBillingPeriodEnd(t *testing.T) {
 		if r.URL.Path == "/v2/users/me/limits" {
 			// Cycle ends Sep 1; CREDIT_RESET_DAY is 1, so fallback would also be
 			// day 1 - use day 15 to distinguish "real endAt" from "fallback".
-			_, _ = w.Write([]byte(`{"data":{"monthlyUsageCycle":{"startAt":"2026-08-15T00:00:00.000Z","endAt":"2026-09-15T23:59:59.999Z"},"limits":{"maxMonthlyUsageUsd":0},"current":{"monthlyUsageUsd":5.0}}}`))
+			_, _ = w.Write([]byte(`{"data":{"monthlyUsageCycle":{"startAt":"2026-09-15T00:00:00.000Z","endAt":"2026-10-15T23:59:59.999Z"},"limits":{"maxMonthlyUsageUsd":0},"current":{"monthlyUsageUsd":5.0}}}`))
 			return
 		}
 		w.WriteHeader(402) // actor endpoint: payment required
@@ -413,7 +481,7 @@ func TestApifyDisable_UsesBillingPeriodEnd(t *testing.T) {
 	r := apifyTestRotator(cfg, NewKeyPool(cfg.APIKeys), apPool, http.DefaultClient, fcFake.URL, apifyFake.URL)
 	r.profiles[1].ApifyFreeCreditUsd = 5
 
-	post(t, r, "/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
+	post(t, r, "/apify/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
 	k := apPool.Snapshot().Keys[0]
 	if !k.Disabled {
 		t.Fatal("key should be disabled after 402")

@@ -9,7 +9,8 @@ multiple API providers, currently **Firecrawl**, **Tavily**, **Apify**, and **Ex
 Each provider is a "profile" with its own key pool, upstream base URL, route
 prefix, and rotation policy.
 
-- **Firecrawl**: requests without a Tavily/Apify prefix go to
+- **Firecrawl**: requests under `/firecrawl` (or, while
+  `FIRECRAWL_LEGACY_FALLBACK=true`, any path no other profile claims) go to
   `api.firecrawl.dev`, with keys selected by remaining credits. Crawl `next`
   pagination URLs are rewritten so pagination stays under rotation.
 - **Tavily**: requests with `/tavily` prefix are routed to `api.tavily.com`
@@ -20,8 +21,9 @@ prefix, and rotation policy.
   transient. **Exa exposes no balance endpoint**, so balances are *accounted*:
   each key starts at `EXA_BUDGET_USD` (default $10, the free tier) and is
   decremented by every response's `costDollars.total`, tracked in **micro-USD**.
-- **Apify**: requests with `/v2/acts` prefix are routed to `api.apify.com`
-  with the prefix **kept** (the real API lives under `/v2/acts`). Auth is the
+- **Apify**: requests with `/apify` prefix are routed to `api.apify.com`
+  with the prefix **stripped** (like every other profile; callers hit
+  `/apify/v2/acts/...` and the upstream receives `/v2/acts/...`). Auth is the
   `?token=` **query param** (rotator replaces/adds it per attempt, drops any
   client `Authorization` header). Own HTTP client with `APIFY_TIMEOUT_SEC`
   (default 180s) because sync actor runs take 30-120s. Balance comes from
@@ -66,9 +68,11 @@ CI (`.github/workflows/build-docker.yml`) builds and pushes `ghcr.io/<repo>:late
 Request flow lives in `proxy.go`'s `rotator.ServeHTTP`. Everything else exists to support it:
 
 1. **Profile routing** (`profile.go`): `ServeHTTP` checks the request path
-   against each profile's `RoutePrefix`. Non-matching requests are handled by
-   the first (Firecrawl) profile. The matching profile's key pool, upstream,
-   and rotation policy are used for the request.
+   against each profile's `RoutePrefix`. A path that no profile claims falls
+   through to the firecrawl profile if either firecrawl has no prefix (the
+   historic default) or `FIRECRAWL_LEGACY_FALLBACK=true` (the migration-period
+   default); with both off the request is `404`. The matched profile's key
+   pool, upstream, and rotation policy are used for the request.
 2. **Buffer request body once** (`io.ReadAll`), then replay it across retry
    attempts - requests are not idempotent-safe to re-send, so the body must
    be re-readable.
@@ -111,7 +115,7 @@ Key files and their roles:
 - **A `success:true` response NEVER rotates.** The denylist is checked only against failure envelopes (`success:false` or 4xx), never the whole body. Scraped content routinely contains "rate limit"/"payment required"/"credits"; scanning the whole body (the original bug) misclassified good responses and burned credits.
 - **Credit-exhausted keys are disabled, not retried.** A genuine 402 / `success:false`+credits envelope disables the key until its reset instant (queried per-key via `/v2/team/credit-usage`); 429/401 rotate-but-keep. Disabling on rate-limit/auth would take a good key offline.
 - **Tavily rotates purely on status codes, never body text.** The Firecrawl denylist (body scanning on failure envelopes) is firecrawl-only. Tavily rejects are detected by status code (401/429 rotate, 432/433 disable), matching Tavily's documented behavior. Apify likewise: 401/429 rotate, 402 disables, status only - a success is a bare dataset-items array with no envelope to scan.
-- **Apify authenticates via `?token=` query param, not a header.** `tryKey` replaces/adds the param per attempt (`AuthQueryParam`) and drops any client `Authorization` header; the rest of the query string is preserved. Its route prefix is **kept** (`KeepPrefix`), and it gets its own `http.Client` with `APIFY_TIMEOUT_SEC` (default 180s) since sync actor runs take 30-120s.
+- **Apify authenticates via `?token=` query param, not a header.** `tryKey` replaces/adds the param per attempt (`AuthQueryParam`) and drops any client `Authorization` header; the rest of the query string is preserved. Its route prefix `/apify` is **stripped** (callers hit `/apify/v2/acts/...`, the upstream receives `/v2/acts/...`), and it gets its own `http.Client` with `APIFY_TIMEOUT_SEC` (default 180s) since sync actor runs take 30-120s.
 - **Apify balances are tracked in CENTS.** `fetchApifyUsage` reads `/v2/users/me/limits`: `remaining = (includedCredit − current.monthlyUsageUsd) × 100`, and the reset instant is `monthlyUsageCycle.endAt` (the billing anniversary). The included credit is the account's own `limits.maxMonthlyUsageUsd` read fresh each fetch (plan changes picked up automatically); `APIFY_FREE_CREDIT_USD` only overrides it when > 0. The pool's low/stop thresholds for apify are cents (`APIFY_LOW/STOP_CREDIT_USD` → cents), so sub-dollar auto-stop is exact.
 - **`EnsureMeasured` fetches a key's balance synchronously on the request path when it's still unmeasured** (`remainingCredits == MaxInt64`). This makes a real balance gate selection from the first request (so a near-empty apify token 503s immediately instead of serving blind at "unmeasured = plenty" until warm-up lands). No-op once measured; a failed fetch fails open (stays unmeasured).
 - **Predicted credits decrement between refreshes.** `Decrement` subtracts `creditsUsed` (or 1) on success so selection stays roughly correct without a refresh per request. Unmeasured keys (MaxInt64) are never decremented. `Refresher` corrects drift: on switch, when predicted < 100 (throttled), and daily.
@@ -122,6 +126,17 @@ Key files and their roles:
 - **Exa balances are accounted in MICRO-USD, and cents would silently break them.** A search costs $0.007, and `int(0.007 * 100) == 0` — so a cents-denominated balance would **never decrement**, leaving every key pinned at a full budget that never auto-stops. Micro-USD keeps $0.007 exact (7000) and still fits int64 ($10 = 10_000_000). The env vars (`EXA_BUDGET_USD` etc.) stay in USD; convert at the boundary. Related: `Decrement` coerces `cost <= 0` to 1, which is the intended "1 credit" estimate for firecrawl/tavily but meaningless as 1 micro-USD, so exa skips the decrement when the response reports no cost (`costOf` returns 0 for it).
 - **A profile with no balance endpoint must be guarded in `fetchUsageFor`, not just left to fall through.** `fetchUsageFor` dispatches on `p.Name` and defaults to the **Firecrawl** endpoint, so an unrecognized profile name silently GETs `{upstream}/v2/team/credit-usage`. For exa that 404s forever while `warmupLoop` retries every minute waiting for "unmeasured == 0", which never arrives. Two guards: an explicit `exa` branch returning `usage{}`, **and** seeding every key's balance in `buildProfiles` so `EnsureMeasured` is a no-op from the first request. `hasPeriodEnd` likewise excludes exa (and tavily) from the disable-time usage query.
 - **`proxyBase` is derived from `req.Host`** when `PROXY_BASE_URL` is unset.
+- **Firecrawl has an explicit `/firecrawl` prefix; the legacy fallback is opt-out.**
+  Callers should use `FIRECRAWL_API_URL=http://...:8788/firecrawl`. The
+  `FIRECRAWL_LEGACY_FALLBACK=true` default keeps a bare-path caller (e.g. one
+  configured as `http://...:8788` with no prefix) routing to firecrawl during
+  migration. Setting it to `false` makes any unmatched path return 404 — turn
+  it off once every caller is on the prefix. Falling back is a safety net,
+  not semantics; do not build new behaviour that depends on it.
+- **Access log**: every completed request emits one `req` info line with
+  `profile matched method path key status dur_ms cost` — this is the forensic
+  trail for "who called firecrawl with what path" questions and the evidence
+  needed before flipping `FIRECRAWL_LEGACY_FALLBACK=false`.
 - **Body cap (`MAX_BODY_BYTES`) is a hard boundary.** Above it, forwarded untouched, no rotate/rewrite. `0` = no cap.
 - **No external dependencies.** Stdlib only. Keep it that way.
 - **Package is `main`**; tests use `httptest` fakes. When testing the rotator, override `backoffSchedule` to short durations (see `testRotator` + `cfgFor` helpers in `proxy_test.go`) so backoff tests don't sleep ~15s.

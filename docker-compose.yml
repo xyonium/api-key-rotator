@@ -13,6 +13,8 @@ services:
       STOP_CREDIT_THRESHOLD: "2"
       CREDIT_REFRESH_INTERVAL: "300"
       LOG_LEVEL: "info"
+      # FIRECRAWL_ROUTE_PREFIX: "/firecrawl"         # callers should point at /<prefix>
+      # FIRECRAWL_LEGACY_FALLBACK: "true"            # "false" = 404 on unmatched paths
       # FIRECRAWL_MAX_CONCURRENT_PER_KEY: "1"      # max in-flight per firecrawl key (0=unlimited)
       # FIRECRAWL_CONCURRENCY_SATURATION: "queue"  # queue | reject when all keys busy
       # FIRECRAWL_CONCURRENCY_QUEUE_MS: "15000"    # queued wait for a free slot before 503
@@ -29,7 +31,7 @@ services:
       # EXA_STOP_CREDIT_USD: "0.10"                # 503 when every key is below this
       # APIFY_API_KEYS: "apify-token1,apify-token2" # optional apify profile
       # APIFY_UPSTREAM: "https://api.apify.com"     # point at your own fake/stub for testing
-      # APIFY_ROUTE_PREFIX: "/v2/acts"              # kept in forwarded path
+      # APIFY_ROUTE_PREFIX: "/apify"                # stripped; callers hit /apify/v2/acts/...
       # APIFY_TIMEOUT_SEC: "180"                    # sync actor runs take 30-120s
       # APIFY_FREE_CREDIT_USD: "5"                  # override included monthly credit (default: read from account)
       # APIFY_LOW_CREDIT_USD: "0.10"                # rotate off a token below this balance
@@ -71,5 +73,5 @@ services:
     environment:
       # mcpo's config.json sets FIRECRAWL_API_URL per MCP server; shown here
       # for clarity. The key is REMOVED - the rotator injects it.
-      FIRECRAWL_API_URL: "http://api-key-rotator:8788"
+      FIRECRAWL_API_URL: "http://api-key-rotator:8788/firecrawl"
     restart: unless-stopped

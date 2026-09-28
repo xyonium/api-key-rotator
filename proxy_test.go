@@ -10,17 +10,24 @@ import (
 	"time"
 )
 
-// testRotator builds a rotator with a single firecrawl profile from cfg, with
-// credit thresholds set and a nil refresher.
+// testRotator builds a rotator with a single firecrawl profile from cfg. The
+// profile mirrors the production default: /firecrawl prefix + legacy fallback
+// enabled, so a request to either /firecrawl/v2/... or the bare /v2/... both
+// route to it (tests use whichever path best matches the scenario). Credit
+// thresholds come from cfg.
 func testRotator(cfg Config, pool *KeyPool, client *http.Client) *rotator {
 	pool.SetThresholds(cfg.LowCreditThreshold, cfg.StopCreditThreshold)
 	p := &Profile{
 		Name:           "firecrawl",
+		RoutePrefix:    "/firecrawl",
 		Upstream:       cfg.Upstream,
 		UpstreamHost:   cfg.UpstreamHost,
 		CreditResetDay: cfg.CreditResetDay,
 		RewriteNext:    true,
 		pool:           pool,
+	}
+	if cfg.FirecrawlRoutePrefix != "" {
+		p.RoutePrefix = cfg.FirecrawlRoutePrefix
 	}
 	return newRotator(cfg, []*Profile{p}, client, newLogger("info"))
 }
@@ -48,14 +55,18 @@ func newFakeBackend(t *testing.T, badKey, goodKey string) *httptest.Server {
 
 func cfgFor(fake *httptest.Server) Config {
 	return Config{
-		APIKeys:            []string{"fc-a", "fc-b"},
-		Upstream:           fake.URL,
-		UpstreamHost:       httptestURLHost(fake.URL),
-		MaxPasses:          2,
-		MaxBodyBytes:       16 * 1024 * 1024,
-		ProxyBaseURL:       "http://rotator.test",
-		LowCreditThreshold: 10,
-		StopCreditThreshold: 2,
+		APIKeys:                []string{"fc-a", "fc-b"},
+		Upstream:               fake.URL,
+		UpstreamHost:           httptestURLHost(fake.URL),
+		MaxPasses:              2,
+		MaxBodyBytes:           16 * 1024 * 1024,
+		ProxyBaseURL:           "http://rotator.test",
+		LowCreditThreshold:     10,
+		StopCreditThreshold:    2,
+		// Mirror production defaults: explicit /firecrawl prefix + legacy
+		// fallback kept on so bare-path callers still route to firecrawl.
+		FirecrawlRoutePrefix:    "/firecrawl",
+		FirecrawlLegacyFallback: true,
 	}
 }
 
@@ -501,4 +512,158 @@ func httptestURLHost(raw string) string {
 		return raw
 	}
 	return u.Host
+}
+
+// TestRotator_PrefixStripped: /firecrawl/v2/scrape must hit the firecrawl
+// profile with /v2/scrape (upstream sees no /firecrawl segment).
+func TestRotator_PrefixStripped(t *testing.T) {
+	var seenPath string
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer fake.Close()
+
+	cfg := cfgFor(fake)
+	pool := NewKeyPool(cfg.APIKeys)
+	withCredits(pool)
+	r := testRotator(cfg, pool, fake.Client())
+
+	req := httptest.NewRequest("POST", "/firecrawl/v2/scrape", bytes.NewReader([]byte(`{"url":"x"}`)))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if seenPath != "/v2/scrape" {
+		t.Fatalf("upstream saw path %q, want /v2/scrape (prefix must be stripped)", seenPath)
+	}
+}
+
+// TestRotator_LegacyFallbackOn_UnknownPathRoutes: with FIRECRAWL_LEGACY_FALLBACK
+// on, a bare /v2/scrape (no /firecrawl prefix) still resolves to firecrawl.
+func TestRotator_LegacyFallbackOn_UnknownPathRoutes(t *testing.T) {
+	hits := 0
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(200)
+	}))
+	defer fake.Close()
+
+	cfg := cfgFor(fake) // FirecrawlRoutePrefix=/firecrawl, FirecrawlLegacyFallback=true
+	pool := NewKeyPool(cfg.APIKeys)
+	withCredits(pool)
+	r := testRotator(cfg, pool, fake.Client())
+
+	req := httptest.NewRequest("POST", "/v2/scrape", bytes.NewReader([]byte(`{"url":"x"}`)))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 (legacy fallback)", rec.Code)
+	}
+	if hits != 1 {
+		t.Fatalf("upstream hits = %d, want 1", hits)
+	}
+}
+
+// TestRotator_LegacyFallbackOff_UnknownPath404: with fallback off, a bare
+// path no other profile claims must 404.
+func TestRotator_LegacyFallbackOff_UnknownPath404(t *testing.T) {
+	hits := 0
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(200)
+	}))
+	defer fake.Close()
+
+	cfg := cfgFor(fake)
+	cfg.FirecrawlLegacyFallback = false
+	pool := NewKeyPool(cfg.APIKeys)
+	withCredits(pool)
+	r := testRotator(cfg, pool, fake.Client())
+
+	for _, path := range []string{"/v2/scrape", "/", "/garbage"} {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest("POST", path, nil))
+		if rec.Code != 404 {
+			t.Errorf("path %q: status = %d, want 404", path, rec.Code)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("upstream hits = %d, want 0 (unmatched path must not call upstream)", hits)
+	}
+}
+
+// TestRotator_LegacyFallbackOff_PrefixedStillWorks: with fallback off, the
+// /firecrawl prefix must continue to route.
+func TestRotator_LegacyFallbackOff_PrefixedStillWorks(t *testing.T) {
+	hits := 0
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(200)
+	}))
+	defer fake.Close()
+
+	cfg := cfgFor(fake)
+	cfg.FirecrawlLegacyFallback = false
+	pool := NewKeyPool(cfg.APIKeys)
+	withCredits(pool)
+	r := testRotator(cfg, pool, fake.Client())
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("POST", "/firecrawl/v2/scrape", bytes.NewReader([]byte(`{}`))))
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if hits != 1 {
+		t.Fatalf("upstream hits = %d, want 1", hits)
+	}
+}
+
+// TestRotator_LegacyFallbackOff_NonFirecrawlPrefixUnaffected: other profiles
+// with their own prefixes must still be matched, independently of the
+// firecrawl fallback switch.
+func TestRotator_LegacyFallbackOff_NonFirecrawlPrefixUnaffected(t *testing.T) {
+	hits := 0
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(200)
+	}))
+	defer fake.Close()
+
+	fcPool := NewKeyPool([]string{"fc-a"})
+	withCredits(fcPool)
+	cfg := cfgFor(fake)
+	cfg.FirecrawlLegacyFallback = false
+	fc := &Profile{
+		Name:           "firecrawl",
+		RoutePrefix:    "/firecrawl",
+		Upstream:       cfg.Upstream,
+		UpstreamHost:   cfg.UpstreamHost,
+		CreditResetDay: cfg.CreditResetDay,
+		RewriteNext:    true,
+		pool:           fcPool,
+	}
+	tvPool := NewKeyPool([]string{"tvly-a"})
+	tvPool.SetCredits(0, 100)
+	tv := &Profile{
+		Name:        "tavily",
+		RoutePrefix: "/tavily",
+		Upstream:    cfg.Upstream,
+		pool:        tvPool,
+	}
+	r := newRotator(cfg, []*Profile{fc, tv}, fake.Client(), newLogger("info"))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("POST", "/tavily/search", bytes.NewReader([]byte(`{}`))))
+	if rec.Code != 200 {
+		t.Fatalf("/tavily/search status = %d, want 200 (tavily profile unaffected)", rec.Code)
+	}
+	if hits != 1 {
+		t.Fatalf("upstream hits = %d, want 1", hits)
+	}
 }

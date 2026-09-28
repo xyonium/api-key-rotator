@@ -33,9 +33,17 @@ api-key-rotator:
 
 firecrawl:                     # your existing mcpo + firecrawl-mcp service
   environment:
-    FIRECRAWL_API_URL: "http://api-key-rotator:8788"
+    FIRECRAWL_API_URL: "http://api-key-rotator:8788/firecrawl"
     # FIRECRAWL_API_KEY removed - the rotator injects it
 ```
+
+The rotator exposes each provider on its own URL prefix
+(`/firecrawl`, `/tavily`, `/exa`, `/fmp`, `/alphavantage`, `/marketaux`,
+`/apify` for Apify). During the migration window, requests to a bare path
+(e.g. `http://api-key-rotator:8788/v2/scrape` with no `/firecrawl` prefix)
+still reach the firecrawl profile — that's the **legacy fallback**, designed
+to keep old callers working while they migrate. Flip
+`FIRECRAWL_LEGACY_FALLBACK=false` to make unrecognized paths return 404.
 
 ## Configuration (env vars)
 
@@ -43,6 +51,8 @@ firecrawl:                     # your existing mcpo + firecrawl-mcp service
 |-----|---------|---------|
 | `FIRECRAWL_API_KEYS` | (required) | Comma-separated key pool. |
 | `UPSTREAM` | `https://api.firecrawl.dev` | Upstream Firecrawl API base. |
+| `FIRECRAWL_ROUTE_PREFIX` | `/firecrawl` | Route prefix that selects the Firecrawl profile. Stripped before forwarding. Set to empty to restore the historic catch-all behaviour. |
+| `FIRECRAWL_LEGACY_FALLBACK` | `true` | When `true`, any path no other profile claims still routes to Firecrawl (kept on during the caller migration). When `false`, unmatched paths return 404. Ignored if `FIRECRAWL_ROUTE_PREFIX` is empty. |
 | `UPSTREAM_PROXY` | (unset) | Explicit forward proxy for egress (`http`/`https`/`socks5`/`socks5h`). With `socks5h`, DNS is resolved through the SOCKS5 server (same as `socks5`; the `h` form is accepted for curl/SearXNG-style configs). Wins over system vars. |
 | `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` | (unset) | System/curl-style proxy env, honored when `UPSTREAM_PROXY` is unset. |
 | `PORT` | `8788` | Listen port. |
@@ -71,12 +81,12 @@ firecrawl:                     # your existing mcpo + firecrawl-mcp service
 | `EXA_STOP_CREDIT_USD` | `0.10` | Stop serving (503) when every Exa key is below this. |
 | `APIFY_API_KEYS` | (unset) | Comma-separated Apify token pool. When set, enables the Apify profile. |
 | `APIFY_UPSTREAM` | `https://api.apify.com` | Upstream Apify API base. |
-| `APIFY_ROUTE_PREFIX` | `/v2/acts` | Route prefix that selects the Apify profile. **Kept** in the forwarded path (Apify's real API lives under `/v2/acts`). Note: this shadows those specific paths on the Firecrawl default profile; other `/v2/*` paths are unaffected. |
+| `APIFY_ROUTE_PREFIX` | `/apify` | Route prefix that selects the Apify profile. **Stripped** before forwarding (callers hit `/apify/v2/acts/...` and Apify receives `/v2/acts/...`, keeping every profile prefixed). |
 | `APIFY_TIMEOUT_SEC` | `180` | Upstream client timeout for the Apify profile. Synchronous actor runs take 30-120s, so this must comfortably exceed `timeout=` in the request URL. |
 | `APIFY_FREE_CREDIT_USD` | (unset = auto) | Override for the plan's **included** monthly credit. When unset, the rotator reads it fresh from the account's `limits.maxMonthlyUsageUsd` on every fetch (so a plan change is picked up automatically). Set it only to force a different value. remaining = `credit − current.monthlyUsageUsd`. |
 | `APIFY_LOW_CREDIT_USD` | `0.10` | Rotate off a token when its remaining balance drops below this. |
 | `APIFY_STOP_CREDIT_USD` | `0.05` | Stop serving (503) when every Apify token is below this, until the usage cycle resets. |
-| `LOG_LEVEL` | `info` | `debug` adds per-request lines. |
+| `LOG_LEVEL` | `info` | `info` already logs one `req` line per completed request (`profile=… matched=… method=… path=… key=… status=… dur_ms=… cost=…`); `debug` adds the rotation internals. |
 
 ## Endpoints
 
@@ -289,17 +299,19 @@ curl -X POST http://localhost:8788/exa/search \
 
 When `APIFY_API_KEYS` is set, the proxy creates a separate token pool for
 Apify. Requests whose path starts with `APIFY_ROUTE_PREFIX` (default
-`/v2/acts`) are routed to `https://api.apify.com`:
+`/apify`) are routed to `https://api.apify.com`:
 
 - **Auth is a query param, not a header.** Clients put `?token=...` in the
   URL (or omit it); the rotator replaces/adds the `token` query parameter
   with the pooled token on every attempt. Any client-sent `Authorization`
   header is dropped. The rest of the query string (`timeout=120`, ...) is
   preserved verbatim.
-- **Prefix is kept, not stripped.** A request to
-  `/v2/acts/{user}~{actor}/run-sync-get-dataset-items` is forwarded to
-  `{APIFY_UPSTREAM}/v2/acts/{user}~{actor}/run-sync-get-dataset-items`
-  unchanged.
+- **Prefix is stripped, like every other profile.** A request to
+  `/apify/v2/acts/{user}~{actor}/run-sync-get-dataset-items` is forwarded to
+  `{APIFY_UPSTREAM}/v2/acts/{user}~{actor}/run-sync-get-dataset-items` -
+  point `APIFY_BASE_URL` (or your SDK's base URL) at
+  `http://api-key-rotator:8788/apify` and append the usual `/v2/acts/...`
+  path.
 - **Long timeout.** The Apify profile gets its own HTTP client with
   `APIFY_TIMEOUT_SEC` (default 180s) instead of the shared 30s, because
   synchronous actor runs take 30-120s.
@@ -333,7 +345,7 @@ Apify. Requests whose path starts with `APIFY_ROUTE_PREFIX` (default
 Client usage (no SDK, plain HTTP):
 
 ```bash
-curl -X POST "http://localhost:8788/v2/acts/apimaestro~linkedin-posts-search-scraper-no-cookies/run-sync-get-dataset-items?timeout=120" \
+curl -X POST "http://localhost:8788/apify/v2/acts/apimaestro~linkedin-posts-search-scraper-no-cookies/run-sync-get-dataset-items?timeout=120" \
   -H "Content-Type: application/json" \
   -d '{"searchUrl":"https://www.linkedin.com/search/results/content/?keywords=ai"}'
 # ?token= is optional - the rotator injects/replaces it from APIFY_API_KEYS.
@@ -437,7 +449,7 @@ This project was originally named `firecrawl-rotator`. The rename to
 |------|-----|-----|
 | Docker image | `ghcr.io/<you>/firecrawl-rotator` | `ghcr.io/<you>/api-key-rotator` |
 | Compose service name | `firecrawl-rotator` | `api-key-rotator` |
-| `FIRECRAWL_API_URL` host | `http://firecrawl-rotator:8788` | `http://api-key-rotator:8788` |
+| `FIRECRAWL_API_URL` host | `http://firecrawl-rotator:8788` | `http://api-key-rotator:8788/firecrawl` |
 | Binary / healthcheck | `/rotator -healthcheck` | `/api-key-rotator -healthcheck` |
 
 Update your `docker-compose.yml` service name, image tag, healthcheck path,

@@ -95,11 +95,42 @@ func (r *rotator) serveOnce(p *Profile, req *http.Request, inBody []byte, stripp
 }
 
 func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	p, strippedPath, ok := matchProfile(r.profiles, req.URL.Path)
+	start := time.Now()
+	// Access log: one structured line per completed request, deferred so it
+	// fires on every exit path (early error, saturation 503, 404 not-found,
+	// success). Routing details (profile + final key index + final status) are
+	// filled in via closures before writing the response. This is THE forensic
+	// trail for "who called firecrawl with what path" questions.
+	var (
+		accProfile = ""
+		accKey     = -1
+		accStatus  = 0
+		accCost    int64
+		accMatched = false // true once a profile claimed the request
+	)
+	defer func() {
+		if accProfile == "" {
+			accProfile = "none"
+		}
+		r.log.info("req",
+			"profile", accProfile,
+			"matched", accMatched,
+			"method", req.Method,
+			"path", req.URL.Path,
+			"key", accKey,
+			"status", accStatus,
+			"dur_ms", time.Since(start).Milliseconds(),
+			"cost", accCost)
+	}()
+
+	p, strippedPath, ok := matchProfile(r.profiles, req.URL.Path, r.cfg.FirecrawlLegacyFallback)
 	if !ok {
+		accStatus = http.StatusNotFound
 		http.Error(w, `{"success":false,"error":"no profile configured for this path"}`, http.StatusNotFound)
 		return
 	}
+	accMatched = true
+	accProfile = p.Name
 
 	// Buffer the incoming body once so retries can replay it.
 	inBody, err := io.ReadAll(req.Body)
@@ -132,6 +163,7 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 		if res.kind == resSaturated {
 			if saturation == "reject" {
+				accStatus = http.StatusTooManyRequests
 				r.log.warn("all keys busy, rejecting", "profile", p.Name)
 				http.Error(w, `{"success":false,"error":"all keys busy","profile":"`+p.Name+`"}`, http.StatusTooManyRequests)
 				return
@@ -139,8 +171,9 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			remaining := time.Until(queueDeadline)
 			if p.ConcurrencyQueue <= 0 || remaining <= 0 || !p.pool.WaitForSlot(req.Context(), remaining) {
 				if req.Context().Err() != nil {
-					return // client went away; don't write
+					return // client went away; don't write (access log: accStatus stays 0 = client abort)
 				}
+				accStatus = http.StatusServiceUnavailable
 				r.log.warn("all keys busy, queue timeout", "profile", p.Name, "keys", p.pool.Snapshot().Keys)
 				http.Error(w, `{"success":false,"error":"all keys busy, queue timeout","profile":"`+p.Name+`"}`, http.StatusServiceUnavailable)
 				return
@@ -174,6 +207,9 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 					p.pool.Decrement(res.idx, cost)
 				}
 			}
+			accKey = res.idx
+			accStatus = res.status
+			accCost = costOf(p, res.body)
 			// Daily-capped finance profiles (fmp/alphavantage/marketaux) disabled
 			// themselves via their own 429/402, not via Decrement: a key sitting
 			// at PredictedRemaining == StopCredit should refuse BEFORE it can
@@ -192,6 +228,8 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		case resCapped:
 			overCap = true
 			cleanBreak = true
+			accKey = res.idx
+			accStatus = res.status
 			r.log.warn("response body over MAX_BODY_BYTES, forwarding untouched", "profile", p.Name, "key", res.idx)
 		case resNetErr:
 			// lastErr carries the underlying cause (net.Err with dial/DNS/TLS
@@ -249,6 +287,7 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// If every key is credit-exhausted, return 503 with a clear message.
 	if idx, _ := p.pool.Current(); idx < 0 {
+		accStatus = http.StatusServiceUnavailable
 		r.log.warn("503: no usable key, all credit-exhausted", "profile", p.Name, "keys", p.pool.Snapshot().Keys)
 		http.Error(w, `{"success":false,"error":"all keys credit-exhausted until billing reset","profile":"`+p.Name+`"}`, http.StatusServiceUnavailable)
 		return
@@ -258,6 +297,7 @@ func (r *rotator) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// (e.g. a real 401/402). lastStatus 0 means we never got a response; tell
 	// the client it was an egress/network problem so they don't go rotate keys.
 	if !cleanBreak && lastStatus == 0 {
+		accStatus = http.StatusBadGateway
 		http.Error(w, `{"success":false,"error":"upstream unreachable (network/DNS/TLS or egress blocked)"}`, http.StatusBadGateway)
 		return
 	}

@@ -36,6 +36,8 @@ func TestLoadConfig_defaults(t *testing.T) {
 		FirecrawlConcurrencySaturation: "queue",
 		FirecrawlConcurrencyQueueMs:    15000,
 		Firecrawl403Retries:            1,
+		FirecrawlRoutePrefix:           "/firecrawl",
+		FirecrawlLegacyFallback:        true,
 		Tavily: TavilyConfig{
 			APIKeys:     nil,
 			Upstream:    "https://api.tavily.com",
@@ -61,7 +63,7 @@ func TestLoadConfig_defaults(t *testing.T) {
 		Apify: ApifyConfig{
 			APIKeys:         nil,
 			Upstream:        "https://api.apify.com",
-			RoutePrefix:     "/v2/acts",
+			RoutePrefix:     "/apify",
 			TimeoutSec:      180,
 			FreeCreditUsd:   0, // 0 = no override: use the account's own included monthly credit
 			LowCreditCents:  10,
@@ -290,7 +292,7 @@ func TestLoadConfig_apifyDefaultsWhenUnset(t *testing.T) {
 	if cfg.Apify.Upstream != "https://api.apify.com" {
 		t.Fatalf("Apify.Upstream = %q", cfg.Apify.Upstream)
 	}
-	if cfg.Apify.RoutePrefix != "/v2/acts" {
+	if cfg.Apify.RoutePrefix != "/apify" {
 		t.Fatalf("Apify.RoutePrefix = %q", cfg.Apify.RoutePrefix)
 	}
 	if cfg.Apify.TimeoutSec != 180 {
@@ -334,7 +336,7 @@ func TestLoadConfig_apifyBadTimeoutErrors(t *testing.T) {
 func TestLoadConfig_apifyBadPrefixErrors(t *testing.T) {
 	t.Setenv("FIRECRAWL_API_KEYS", "fc-a")
 	t.Setenv("APIFY_API_KEYS", "apify-a")
-	for _, bad := range []string{"v2/acts", "/", "/v2/acts/", "/healthz", "/status"} {
+	for _, bad := range []string{"v2/acts", "/", "/apify/", "/healthz", "/status"} {
 		t.Setenv("APIFY_ROUTE_PREFIX", bad)
 		if _, err := LoadConfig(); err == nil {
 			t.Fatalf("expected error for APIFY_ROUTE_PREFIX=%q, got nil", bad)

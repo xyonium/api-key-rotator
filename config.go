@@ -32,6 +32,16 @@ type Config struct {
 	FirecrawlConcurrencySaturation string // "queue" (wait for a slot) or "reject" (429) when all keys busy
 	FirecrawlConcurrencyQueueMs   int    // how long a queued request waits for a free slot (default 15000)
 	Firecrawl403Retries           int    // same-key retries on a 403 before rotating (default 1; 0 = legacy full backoff)
+	// FirecrawlRoutePrefix is the explicit route for the firecrawl profile
+	// (default "/firecrawl"). Callers pick firecrawl by hitting this prefix;
+	// when empty, firecrawl becomes the catch-all (legacy behaviour).
+	FirecrawlRoutePrefix string
+	// FirecrawlLegacyFallback keeps the historic "every unrecognized path goes
+	// to firecrawl" behaviour alive while FIRECRAWL_ROUTE_PREFIX is set. True
+	// by default so existing callers that still point at the bare host:port are
+	// not broken on upgrade. Set to false (FIRECRAWL_LEGACY_FALLBACK=false)
+	// once every caller has moved to the /firecrawl prefix.
+	FirecrawlLegacyFallback bool
 	Tavily              TavilyConfig
 	Apify               ApifyConfig
 	Exa                            ExaConfig
@@ -322,6 +332,16 @@ func LoadConfig() (Config, error) {
 		return Config{}, fmt.Errorf("FIRECRAWL_CONCURRENCY_QUEUE_MS must be >= 0, got %d", queueMs)
 	}
 
+	// Firecrawl routing. Default: explicit /firecrawl prefix + legacy fallback
+	// so every historical caller keeps working while they migrate.
+	fcPrefix := envStr("FIRECRAWL_ROUTE_PREFIX", "/firecrawl")
+	if fcPrefix != "" {
+		if err := checkRoutePrefix("FIRECRAWL", fcPrefix); err != nil {
+			return Config{}, err
+		}
+	}
+	fcLegacyFallback := os.Getenv("FIRECRAWL_LEGACY_FALLBACK") != "false"
+
 	return Config{
 		APIKeys:       keys,
 		Tavily:        tavily,
@@ -347,6 +367,8 @@ func LoadConfig() (Config, error) {
 		FirecrawlConcurrencySaturation: saturation,
 		FirecrawlConcurrencyQueueMs:    queueMs,
 		Firecrawl403Retries:            retries403,
+		FirecrawlRoutePrefix:           fcPrefix,
+		FirecrawlLegacyFallback:        fcLegacyFallback,
 	}, nil
 }
 
@@ -398,14 +420,15 @@ func loadTavilyConfig(sharedLow, sharedStop int64, retries403 int) (TavilyConfig
 
 // loadApifyConfig parses the APIFY_* env vars. The route prefix must start
 // with '/', must not end with '/', and must not shadow the reserved /healthz
-// or /status paths. The default prefix /v2/acts shadows only Apify actor
-// endpoints on the firecrawl default profile; other /v2/* paths (firecrawl's
-// own API) are unaffected. APIFY_TIMEOUT_SEC must cover synchronous actor
-// runs (30-120s), so it defaults to 180 and must be positive.
+// or /status paths. The default prefix /apify makes Apify one of the explicit
+// prefixed profiles (like /firecrawl, /tavily, /exa); it is stripped before
+// forwarding to api.apify.com so callers hit `/apify/v2/acts/...` and the
+// upstream receives `/v2/acts/...`. APIFY_TIMEOUT_SEC must cover synchronous
+// actor runs (30-120s), so it defaults to 180 and must be positive.
 func loadApifyConfig() (ApifyConfig, error) {
 	a := ApifyConfig{
 		APIKeys:         parseKeys(os.Getenv("APIFY_API_KEYS")),
-		RoutePrefix:     envStr("APIFY_ROUTE_PREFIX", "/v2/acts"),
+		RoutePrefix:     envStr("APIFY_ROUTE_PREFIX", "/apify"),
 		TimeoutSec:      180,
 		FreeCreditUsd:   0, // 0 = no override: read the included credit from the account each fetch
 		LowCreditCents:  10, // $0.10

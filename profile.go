@@ -19,7 +19,9 @@ type Profile struct {
 	CreditResetDay int
 	RewriteNext    bool // rewrite "next" pagination URLs (firecrawl only)
 	// KeepPrefix forwards the matched RoutePrefix as part of the upstream path
-	// instead of stripping it (apify: the real API lives under /v2/acts).
+	// instead of stripping it. No built-in profile sets this (apify stripped
+	// /apify as of the 2026-09 prefix migration); it only kicks in when an
+	// explicit APIFY_ROUTE_PREFIX points at a path the upstream needs verbatim.
 	KeepPrefix bool
 	// AuthQueryParam authenticates by setting this query parameter to the key
 	// instead of an Authorization header (apify: "token").
@@ -52,15 +54,17 @@ type Profile struct {
 }
 
 // buildProfiles constructs the runtime profiles from config. The firecrawl
-// (default, unprefixed) profile always comes first. Tavily is appended only
-// when TAVILY_API_KEYS is set. Each profile gets its own KeyPool with its own
-// thresholds.
+// profile always comes first; it uses the FIRECRAWL_ROUTE_PREFIX (default
+// /firecrawl) and only acts as a catch-all when FIRECRAWL_LEGACY_FALLBACK
+// allows it. Tavily is appended only when TAVILY_API_KEYS is set. Each
+// profile gets its own KeyPool with its own thresholds.
 func buildProfiles(cfg Config) []*Profile {
 	fcPool := NewKeyPool(cfg.APIKeys)
 	fcPool.SetThresholds(cfg.LowCreditThreshold, cfg.StopCreditThreshold)
 	fcPool.SetMaxConcurrent(cfg.FirecrawlMaxConcurrentPerKey)
 	profiles := []*Profile{{
 		Name:           "firecrawl",
+		RoutePrefix:    cfg.FirecrawlRoutePrefix,
 		Upstream:       cfg.Upstream,
 		UpstreamHost:   cfg.UpstreamHost,
 		CreditResetDay: cfg.CreditResetDay,
@@ -138,7 +142,11 @@ func buildProfiles(cfg Config) []*Profile {
 			UpstreamHost:       host,
 			CreditResetDay:     cfg.CreditResetDay,
 			RewriteNext:        false,
-			KeepPrefix:         true,
+			// Prefix is stripped: callers hit /apify/v2/acts/... and the
+			// upstream receives /v2/acts/... (as of the 2026-09 migration the
+			// rotator prefixes every profile; the old bare-/`/v2/acts` routing
+			// only exists when APIFY_ROUTE_PREFIX is overridden explicitly).
+			KeepPrefix:         false,
 			AuthQueryParam:     "token",
 			UpstreamTimeout:    time.Duration(cfg.Apify.TimeoutSec) * time.Second,
 			ApifyFreeCreditUsd: cfg.Apify.FreeCreditUsd,
@@ -388,14 +396,23 @@ func (p *Profile) isCreditExhausted(status int, body []byte) bool {
 // matchProfile resolves a request path to a profile. A prefixed profile
 // matches when path == prefix or path starts with prefix+"/" (segment
 // boundary, so "/tavilyfoo" does not match "/tavily"). The matched prefix is
-// stripped unless the profile sets KeepPrefix. The no-prefix profile is the
-// fallback for everything else, including prefixes that were never configured.
-func matchProfile(profiles []*Profile, path string) (*Profile, string, bool) {
-	var def *Profile
+// stripped unless the profile sets KeepPrefix.
+//
+// Fallback ("firecrawl gets whatever isn't claimed") only applies when a
+// profile has RoutePrefix == "" (historic behaviour). Once every profile has
+// an explicit prefix, no match returns ok=false and the request is 404.
+// legacyFallback keeps this safety net for the migration window: when true,
+// a path that no profile claims goes to the firecrawl profile (by name),
+// stripped of no prefix. When false, unmatched paths 404.
+func matchProfile(profiles []*Profile, path string, legacyFallback bool) (*Profile, string, bool) {
+	var def, firecrawl *Profile
 	for _, p := range profiles {
 		if p.RoutePrefix == "" {
 			def = p
 			continue
+		}
+		if p.Name == "firecrawl" {
+			firecrawl = p
 		}
 		if path == p.RoutePrefix {
 			if p.KeepPrefix {
@@ -412,6 +429,9 @@ func matchProfile(profiles []*Profile, path string) (*Profile, string, bool) {
 	}
 	if def != nil {
 		return def, path, true
+	}
+	if legacyFallback && firecrawl != nil {
+		return firecrawl, path, true
 	}
 	return nil, path, false
 }

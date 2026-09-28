@@ -10,7 +10,7 @@ import (
 )
 
 // apifyTestRotator builds a rotator with firecrawl (default, fcFake) and apify
-// (/v2/acts, apifyFake) profiles, mirroring tavilyTestRotator. The apify
+// (/apify, apifyFake) profiles, mirroring tavilyTestRotator. The apify
 // profile gets a refresher so EnsureMeasured can fetch real balances; its
 // limits responses come from the fake's /v2/users/me/limits branch.
 func apifyTestRotator(cfg Config, fcPool, apPool *KeyPool, client *http.Client, fcUpstream, apifyUpstream string) *rotator {
@@ -27,12 +27,12 @@ func apifyTestRotator(cfg Config, fcPool, apPool *KeyPool, client *http.Client, 
 		}
 		return u
 	}
-	fc := &Profile{Name: "firecrawl", Upstream: fcUpstream, UpstreamHost: host(fcUpstream), CreditResetDay: cfg.CreditResetDay, RewriteNext: true, pool: fcPool}
+	fc := &Profile{Name: "firecrawl", RoutePrefix: cfg.FirecrawlRoutePrefix, Upstream: fcUpstream, UpstreamHost: host(fcUpstream), CreditResetDay: cfg.CreditResetDay, RewriteNext: true, pool: fcPool}
 	freeUsd := cfg.Apify.FreeCreditUsd
 	if freeUsd == 0 {
 		freeUsd = 5
 	}
-	ap := &Profile{Name: "apify", RoutePrefix: "/v2/acts", Upstream: apifyUpstream, UpstreamHost: host(apifyUpstream), CreditResetDay: cfg.CreditResetDay, KeepPrefix: true, AuthQueryParam: "token", ApifyFreeCreditUsd: freeUsd, pool: apPool}
+	ap := &Profile{Name: "apify", RoutePrefix: "/apify", Upstream: apifyUpstream, UpstreamHost: host(apifyUpstream), CreditResetDay: cfg.CreditResetDay, KeepPrefix: false, AuthQueryParam: "token", ApifyFreeCreditUsd: freeUsd, pool: apPool}
 	r := newRotator(cfg, []*Profile{fc, ap}, client, newLogger("info"))
 	ap.refresh = NewRefresher(ap, client, cfg, newLogger("info"))
 	return r
@@ -73,12 +73,12 @@ func TestRotator_ApifyTokenQueryParamReplaced(t *testing.T) {
 	withCredits(apPool)
 	r := apifyTestRotator(cfg, NewKeyPool(cfg.APIKeys), apPool, http.DefaultClient, fcFake.URL, apifyFake.URL)
 
-	rec := post(t, r, "/v2/acts/apimaestro~scraper/run-sync-get-dataset-items?token=stale-client-token&timeout=120", `{"q":"x"}`)
+	rec := post(t, r, "/apify/v2/acts/apimaestro~scraper/run-sync-get-dataset-items?token=stale-client-token&timeout=120", `{"q":"x"}`)
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
 	}
 	if gotPath != "/v2/acts/apimaestro~scraper/run-sync-get-dataset-items" {
-		t.Fatalf("upstream path = %q, want full /v2/acts/... path preserved", gotPath)
+		t.Fatalf("upstream path = %q, want /apify prefix stripped to /v2/acts/...", gotPath)
 	}
 	q := gotQuery
 	if !strings.Contains(q, "token=apify-good") {
@@ -114,7 +114,7 @@ func TestRotator_ApifyTokenAddedWhenMissing(t *testing.T) {
 	withCredits(apPool)
 	r := apifyTestRotator(cfg, NewKeyPool(cfg.APIKeys), apPool, http.DefaultClient, fcFake.URL, apifyFake.URL)
 
-	rec := post(t, r, "/v2/acts/u~a/run-sync-get-dataset-items?timeout=60", `{}`)
+	rec := post(t, r, "/apify/v2/acts/u~a/run-sync-get-dataset-items?timeout=60", `{}`)
 	if rec.Code != 200 {
 		t.Fatalf("status = %d (body %q)", rec.Code, rec.Body.String())
 	}
@@ -151,7 +151,7 @@ func TestRotator_ApifyRotatesOn402AndDisables(t *testing.T) {
 	withCredits(apPool)
 	r := apifyTestRotator(cfg, NewKeyPool(cfg.APIKeys), apPool, http.DefaultClient, fcFake.URL, apifyFake.URL)
 
-	rec := post(t, r, "/v2/acts/u~a/run-sync-get-dataset-items?token=whatever", `{}`)
+	rec := post(t, r, "/apify/v2/acts/u~a/run-sync-get-dataset-items?token=whatever", `{}`)
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, want 200 after rotation (body %q)", rec.Code, rec.Body.String())
 	}
@@ -185,7 +185,7 @@ func TestRotator_Apify429RotatesButKeepsKey(t *testing.T) {
 	withCredits(apPool)
 	r := apifyTestRotator(cfg, NewKeyPool(cfg.APIKeys), apPool, http.DefaultClient, fcFake.URL, apifyFake.URL)
 
-	rec := post(t, r, "/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
+	rec := post(t, r, "/apify/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, want 200 (body %q)", rec.Code, rec.Body.String())
 	}
@@ -213,7 +213,7 @@ func TestRotator_ApifySuccessArrayDoesNotRotate(t *testing.T) {
 	apPool := NewKeyPool([]string{"apify-a", "apify-b"}) // unmeasured
 	r := apifyTestRotator(cfg, NewKeyPool(cfg.APIKeys), apPool, http.DefaultClient, fcFake.URL, apifyFake.URL)
 
-	rec := post(t, r, "/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
+	rec := post(t, r, "/apify/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
 	if rec.Code != 200 {
 		t.Fatalf("status = %d", rec.Code)
 	}
@@ -248,7 +248,7 @@ func TestRotator_ApifyDisableUsesFallbackReset(t *testing.T) {
 	apPool.SetCredits(0, 5)
 	r := apifyTestRotator(cfg, NewKeyPool(cfg.APIKeys), apPool, http.DefaultClient, fcFake.URL, apifyFake.URL)
 
-	post(t, r, "/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
+	post(t, r, "/apify/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
 	k := apPool.Snapshot().Keys[0]
 	if !k.Disabled {
 		t.Fatal("key should be disabled after 402")
@@ -284,7 +284,7 @@ func TestRotator_ApifyDisableQueriesLimitsEndpoint(t *testing.T) {
 	apPool.SetCredits(0, 5)
 	r := apifyTestRotator(cfg, NewKeyPool(cfg.APIKeys), apPool, http.DefaultClient, fcFake.URL, apifyFake.URL)
 
-	post(t, r, "/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
+	post(t, r, "/apify/v2/acts/u~a/run-sync-get-dataset-items", `{}`)
 	if limitsCalls.Load() != 1 {
 		t.Fatalf("limits endpoint calls = %d, want 1 (disable should fetch real reset)", limitsCalls.Load())
 	}
